@@ -1,0 +1,7 @@
+{
+  "admin": {
+    "username": "admin",
+    "password": "securepassword123"
+  },
+  "sessionSecret": "gs-ai-change-this-session-secret"
+}

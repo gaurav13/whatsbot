@@ -1,0 +1,10 @@
+node_modules/
+baileys_auth_info/
+.env
+*.log
+ai-config.json
+config.json
+knowledge/*
+!knowledge/.gitkeep
+!knowledge/services.txt
+!knowledge/config.json
