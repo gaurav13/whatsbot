@@ -1,7 +1,21 @@
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { GoogleGenAI } from '@google/genai';
-import { getActiveModelInfo, MODEL_CATALOG, loadAiConfig } from './aiConfigStore.js';
+import {
+  getActiveModelInfo,
+  MODEL_CATALOG,
+  loadAiConfig,
+  normalizeAiProvider,
+  DEFAULT_MODEL_BY_PROVIDER,
+} from './aiConfigStore.js';
+import { redactSecrets } from './whatsappSend.js';
+import {
+  logTokenUsage,
+  phoneFromJid,
+  getTenantSecrets,
+  incrementTenantTokens,
+  QuotaExceededError,
+} from './db.js';
 
 function requireKey(provider, apiKey) {
   if (!apiKey?.trim()) {
@@ -33,7 +47,11 @@ async function callOpenAiCompatible({
     temperature: 0.4,
   });
 
-  return (completion.choices?.[0]?.message?.content || '').trim();
+  return {
+    text: (completion.choices?.[0]?.message?.content || '').trim(),
+    usage: extractOpenAiUsage(completion),
+    modelId: model.id,
+  };
 }
 
 async function callAnthropic({ apiKey, model, systemInstruction, userQuery }) {
@@ -52,7 +70,16 @@ async function callAnthropic({ apiKey, model, systemInstruction, userQuery }) {
     .join('\n')
     .trim();
 
-  return text;
+  return {
+    text,
+    usage: {
+      promptTokenCount: Number(response.usage?.input_tokens) || 0,
+      candidatesTokenCount: Number(response.usage?.output_tokens) || 0,
+      totalTokenCount:
+        Number(response.usage?.input_tokens || 0) + Number(response.usage?.output_tokens || 0),
+    },
+    modelId: model.id,
+  };
 }
 
 async function callGemini({ apiKey, model, systemInstruction, userQuery }) {
@@ -78,10 +105,16 @@ async function callGemini({ apiKey, model, systemInstruction, userQuery }) {
         },
       });
       const text = (response.text || '').trim();
-      if (text) return text;
+      if (text) {
+        return {
+          text,
+          usage: extractGeminiUsage(response),
+          modelId,
+        };
+      }
     } catch (err) {
       lastError = err;
-      const msg = String(err?.message || err);
+      const msg = redactSecrets(err?.message || err);
       const hardFail =
         msg.includes('API key') ||
         msg.includes('PERMISSION') ||
@@ -94,72 +127,229 @@ async function callGemini({ apiKey, model, systemInstruction, userQuery }) {
   throw lastError || new Error('Gemini returned an empty response');
 }
 
-/**
- * Route a sales/chat prompt to the currently selected AI provider/model.
- * Designed so future multi-user sessions can pass per-tenant config later.
- */
-export async function generateAiReply(userQuery, systemInstruction, options = {}) {
-  const active = options.activeInfo || getActiveModelInfo();
-  const { model, apiKey, providerConfig } = active;
+function extractGeminiUsage(response) {
+  const meta =
+    response?.usageMetadata ||
+    response?.usage_metadata ||
+    response?.response?.usageMetadata ||
+    {};
+  const promptTokenCount = Number(meta.promptTokenCount || meta.prompt_token_count) || 0;
+  const candidatesTokenCount =
+    Number(meta.candidatesTokenCount || meta.candidates_token_count) || 0;
+  const totalTokenCount =
+    Number(meta.totalTokenCount || meta.total_token_count) ||
+    promptTokenCount + candidatesTokenCount;
+  return { promptTokenCount, candidatesTokenCount, totalTokenCount };
+}
 
-  if (!model) {
-    throw new Error('No active AI model configured');
+function extractOpenAiUsage(completion) {
+  const usage = completion?.usage || {};
+  const promptTokenCount = Number(usage.prompt_tokens) || 0;
+  const candidatesTokenCount = Number(usage.completion_tokens) || 0;
+  const totalTokenCount = Number(usage.total_tokens) || promptTokenCount + candidatesTokenCount;
+  return { promptTokenCount, candidatesTokenCount, totalTokenCount };
+}
+
+async function persistUsage(result, model, options = {}) {
+  const usage = result?.usage;
+  if (!usage) return;
+  try {
+    await logTokenUsage({
+      jid: options.jid || null,
+      phone: options.phone || phoneFromJid(options.jid),
+      provider: model.provider,
+      model: result.modelId || model.id,
+      promptTokenCount: usage.promptTokenCount,
+      candidatesTokenCount: usage.candidatesTokenCount,
+      totalTokenCount: usage.totalTokenCount,
+      source: options.source || 'whatsapp',
+      tenantId: options.tenantId || options.tenant?.id || null,
+      billingSource: options.billingSource || null,
+    });
+    if (options.billingSource === 'platform' && (options.tenantId || options.tenant?.id)) {
+      await incrementTenantTokens(
+        options.tenantId || options.tenant.id,
+        usage.totalTokenCount
+      );
+    }
+    console.log(
+      `📊 Tokens ${model.provider}/${result.modelId || model.id} ` +
+        `prompt=${usage.promptTokenCount} reply=${usage.candidatesTokenCount} ` +
+        `total=${usage.totalTokenCount} phone=${options.phone || phoneFromJid(options.jid) || 'n/a'}`
+    );
+  } catch (err) {
+    console.warn('token_usage log skipped:', redactSecrets(err?.message || err));
+  }
+}
+
+function byokKeyForProvider(secrets, provider) {
+  if (secrets?.customApiKey) return secrets.customApiKey;
+  if (provider === 'gemini') return secrets?.geminiApiKey || null;
+  if (provider === 'groq') return secrets?.groqApiKey || null;
+  return null;
+}
+
+function modelForTenant(tenantRow, master) {
+  let provider = normalizeAiProvider(tenantRow?.ai_provider);
+  let modelId = String(tenantRow?.ai_model || '').trim();
+
+  if (provider === 'master') {
+    provider = master.model?.provider || 'deepseek';
+    if (!modelId) modelId = master.model?.id || DEFAULT_MODEL_BY_PROVIDER.deepseek;
   }
 
-  console.log(`🧠 AI route provider=${model.provider} model=${model.id}`);
+  return (
+    MODEL_CATALOG.find((m) => m.id === modelId && m.provider === provider) ||
+    MODEL_CATALOG.find((m) => m.id === modelId) ||
+    MODEL_CATALOG.find((m) => m.id === DEFAULT_MODEL_BY_PROVIDER[provider]) ||
+    MODEL_CATALOG.find((m) => m.provider === provider) ||
+    master.model ||
+    MODEL_CATALOG.find((m) => m.id === 'deepseek-chat')
+  );
+}
 
-  let text = '';
+/**
+ * Tenant ai_provider + custom_api_key (BYOK), else master env key for that provider.
+ * Falls back to the admin-selected platform model when the chosen provider has no key.
+ */
+export function resolveTenantAi(tenantRow) {
+  const master = getActiveModelInfo();
+  const cfg = loadAiConfig();
+  const secrets = getTenantSecrets(tenantRow);
+  const model = modelForTenant(tenantRow, master);
+  const providerCfg = cfg.providers[model?.provider] || {};
+  const byok = byokKeyForProvider(secrets, model?.provider);
 
+  if (byok) {
+    return {
+      model,
+      apiKey: byok,
+      providerConfig: { ...providerCfg, apiKey: byok },
+      billingSource: 'byok',
+    };
+  }
+
+  const used = Number(tenantRow?.tokens_used) || 0;
+  const quota = Number(tenantRow?.token_quota) || 50000;
+  if (tenantRow && used >= quota) {
+    throw new QuotaExceededError(quota, used);
+  }
+
+  if (providerCfg.apiKey) {
+    return {
+      model,
+      apiKey: providerCfg.apiKey,
+      providerConfig,
+      billingSource: 'platform',
+    };
+  }
+
+  if (master.apiKey && master.model) {
+    return { ...master, billingSource: 'platform' };
+  }
+
+  throw new Error(
+    `No API key for "${model?.provider || 'ai'}". Add a tenant key on /dashboard or a master key in /admin/ai.`
+  );
+}
+
+async function dispatchModel({ model, apiKey, providerConfig, systemInstruction, userQuery }) {
   switch (model.provider) {
     case 'openai':
-      text = await callOpenAiCompatible({
+      return callOpenAiCompatible({
         apiKey,
         baseUrl: providerConfig.baseUrl,
         model,
         systemInstruction,
         userQuery,
       });
-      break;
     case 'groq':
-      text = await callOpenAiCompatible({
+      return callOpenAiCompatible({
         apiKey,
         baseUrl: providerConfig.baseUrl || 'https://api.groq.com/openai/v1',
         model,
         systemInstruction,
         userQuery,
       });
-      break;
     case 'deepseek':
-      text = await callOpenAiCompatible({
+      return callOpenAiCompatible({
         apiKey,
-        baseUrl: providerConfig.baseUrl || 'https://api.deepseek.com',
+        baseUrl: providerConfig.baseUrl || 'https://api.deepseek.com/v1',
         model,
         systemInstruction,
         userQuery,
       });
-      break;
     case 'anthropic':
-      text = await callAnthropic({
-        apiKey,
-        model,
-        systemInstruction,
-        userQuery,
-      });
-      break;
+      return callAnthropic({ apiKey, model, systemInstruction, userQuery });
     case 'gemini':
-      text = await callGemini({
-        apiKey,
-        model,
-        systemInstruction,
-        userQuery,
-      });
-      break;
+      return callGemini({ apiKey, model, systemInstruction, userQuery });
     default:
       throw new Error(`Unsupported provider: ${model.provider}`);
   }
+}
+
+/**
+ * Route a sales/chat prompt to the currently selected AI provider/model.
+ * Designed so future multi-user sessions can pass per-tenant config later.
+ */
+export async function generateAiReply(userQuery, systemInstruction, options = {}) {
+  const active = options.tenant
+    ? resolveTenantAi(options.tenant)
+    : options.activeInfo || getActiveModelInfo();
+  const { model, apiKey, providerConfig } = active;
+  options.billingSource = active.billingSource || options.billingSource || null;
+  options.tenantId = options.tenantId || options.tenant?.id || null;
+
+  if (!model) {
+    throw new Error('No active AI model configured');
+  }
+
+  console.log(
+    `🧠 AI route provider=${model.provider} model=${model.id} billing=${options.billingSource || 'n/a'} key=${apiKey ? 'set' : 'missing'}`
+  );
+
+  let result = { text: '', usage: null, modelId: model.id };
+
+  try {
+    result = await dispatchModel({
+      model,
+      apiKey,
+      providerConfig,
+      systemInstruction,
+      userQuery,
+    });
+  } catch (err) {
+    if (err instanceof QuotaExceededError) throw err;
+    const master = getActiveModelInfo();
+    const canFallback =
+      active.billingSource !== 'byok' &&
+      master.apiKey &&
+      master.model &&
+      master.model.id !== model.id;
+    if (!canFallback) {
+      throw new Error(redactSecrets(err?.message || err));
+    }
+    console.warn(
+      `⚠️ ${model.provider}/${model.id} failed, falling back to master ${master.model.provider}/${master.model.id}`
+    );
+    result = await dispatchModel({
+      model: master.model,
+      apiKey: master.apiKey,
+      providerConfig: master.providerConfig,
+      systemInstruction,
+      userQuery,
+    });
+    await persistUsage(result, master.model, options);
+    return (
+      result.text ||
+      'Sorry, I could not generate a response right now. Please try again in a moment.'
+    );
+  }
+
+  await persistUsage(result, model, options);
 
   return (
-    text ||
+    result.text ||
     'Sorry, I could not generate a response right now. Please try again in a moment.'
   );
 }

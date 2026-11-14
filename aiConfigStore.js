@@ -61,7 +61,41 @@ export const MODEL_CATALOG = [
     label: 'DeepSeek Chat',
     tier: 'budget',
   },
+  {
+    id: 'deepseek-reasoner',
+    provider: 'deepseek',
+    label: 'DeepSeek Reasoner',
+    tier: 'budget',
+  },
 ];
+
+export const TENANT_AI_PROVIDERS = [
+  { id: 'master', label: 'Platform default (admin model)' },
+  { id: 'deepseek', label: 'DeepSeek' },
+  { id: 'groq', label: 'Groq (Llama 3)' },
+  { id: 'gemini', label: 'Google Gemini' },
+  { id: 'anthropic', label: 'Anthropic Claude' },
+];
+
+export const DEFAULT_MODEL_BY_PROVIDER = {
+  deepseek: 'deepseek-chat',
+  groq: 'llama-3.3-70b-versatile',
+  gemini: 'gemini-2.5-flash-lite',
+  anthropic: 'claude-3-5-sonnet-latest',
+};
+
+export function normalizeAiProvider(value) {
+  const v = String(value || '').toLowerCase().trim();
+  if (v === 'master' || v === 'platform' || v === 'default') return 'master';
+  if (['deepseek', 'groq', 'gemini', 'anthropic'].includes(v)) return v;
+  return 'deepseek';
+}
+
+export function modelsForProvider(provider) {
+  const id = normalizeAiProvider(provider);
+  if (id === 'master') return MODEL_CATALOG.slice();
+  return MODEL_CATALOG.filter((m) => m.provider === id);
+}
 
 function defaultConfig() {
   return {
@@ -83,7 +117,7 @@ function defaultConfig() {
       },
       deepseek: {
         apiKey: process.env.DEEPSEEK_API_KEY || '',
-        baseUrl: 'https://api.deepseek.com',
+        baseUrl: 'https://api.deepseek.com/v1',
       },
     },
     updatedAt: null,

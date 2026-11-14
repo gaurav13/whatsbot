@@ -269,7 +269,11 @@ export async function answerDemoChat(question, profileId = activeProfileId) {
     }
   }
 
-  const reply = await generateAiReply(question, systemInstruction);
+  const reply = await generateAiReply(question, systemInstruction, {
+    jid: 'demo-web',
+    phone: 'demo-web',
+    source: 'demo-chat',
+  });
   return {
     reply,
     profile,

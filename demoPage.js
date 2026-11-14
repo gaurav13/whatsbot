@@ -123,7 +123,8 @@ export function demoPageHtml() {
     <div class="nav">
       <a href="/">QR Login</a>
       <a href="/knowledge">Knowledge</a>
-      <a href="/admin">AI Settings</a>
+      <a href="/admin/dashboard">Tenants</a>
+      <a href="/admin/ai">AI Settings</a>
       <a href="/demo">Demo Hub</a>
       <a href="/logout">Logout</a>
     </div>

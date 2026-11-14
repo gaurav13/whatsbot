@@ -84,6 +84,55 @@ function sanitizeFilename(name) {
     .slice(0, 120);
 }
 
+export async function extractTextFromBuffer(originalName, buffer) {
+  const ext = path.extname(originalName || '').toLowerCase();
+  if (!ALLOWED_EXTENSIONS.has(ext)) {
+    throw new Error(`Unsupported upload type "${ext}". Allowed: .txt .pdf .docx`);
+  }
+  if (!buffer?.length) {
+    throw new Error('Uploaded file is empty');
+  }
+
+  let text = '';
+  if (ext === '.txt') {
+    text = buffer.toString('utf8').trim();
+  } else if (ext === '.pdf') {
+    const parser = new PDFParse({ data: new Uint8Array(buffer) });
+    try {
+      const result = await parser.getText();
+      text = (result?.text || '').trim();
+    } finally {
+      await parser.destroy?.();
+    }
+  } else if (ext === '.docx') {
+    const result = await mammoth.extractRawText({ buffer });
+    text = (result?.value || '').trim();
+  }
+
+  if (!text) {
+    throw new Error('Could not extract text from that file. Try a .txt, .pdf, or .docx.');
+  }
+  return text;
+}
+
+export function tenantKnowledgeDir(tenantId) {
+  const dir = path.join(KNOWLEDGE_DIR, 'tenants', String(tenantId || 'unknown'));
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+export async function saveTenantKnowledgeFile(tenantId, originalName, buffer) {
+  const text = await extractTextFromBuffer(originalName, buffer);
+  const dir = tenantKnowledgeDir(tenantId);
+  const ext = path.extname(originalName || '').toLowerCase() || '.txt';
+  const safe = sanitizeFilename(originalName);
+  const filename = `${Date.now()}_${safe.endsWith(ext) ? safe : `${safe}${ext}`}`;
+  const outPath = path.join(dir, filename);
+  fs.writeFileSync(outPath, buffer);
+  const relativePath = path.relative(path.join(__dirname), outPath).replace(/\\/g, '/');
+  return { text, path: relativePath, filename };
+}
+
 export async function saveUploadedBuffer(originalName, buffer, { makeActive = false } = {}) {
   ensureDir();
   const safe = sanitizeFilename(originalName);

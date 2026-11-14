@@ -5,9 +5,18 @@ import mammoth from 'mammoth';
 import { generateAiReply } from './aiRouter.js';
 import { upsertWebsiteKnowledge } from './db.js';
 import {
+  isVilasaActive,
+  setVilasaActive,
+  getLeadIntake,
+  setLeadIntake,
+  clearLeadIntake as clearUserLeadIntake,
+} from './userSessions.js';
+import {
   sendInteractiveMenu,
   extractInteractiveSelection,
 } from './whatsappInteractive.js';
+import { withComposing, sendWithTyping as defaultSendWithTyping } from './whatsappSend.js';
+import { captureLead, parseContactDetails } from './leadCapture.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const VILASA_DOCX = path.join(__dirname, 'knowledge', 'VILASA_Brochure.docx');
@@ -17,14 +26,18 @@ export const VILASA_BROCHURE_URL =
   'https://drive.google.com/file/d/1IZiAg40P7lIsLwE9npCo1Z_nx4iFn27I/view?usp=sharing';
 const LEADS_PATH = path.join(__dirname, 'vilasa-leads.json');
 
-/** Users currently in the Vilasa real-estate demo conversation */
-export const vilasaSessions = new Set();
-
-/**
- * Active site-visit booking steps per chat.
- * jid → { step: 'date'|'time'|'contact', preferredDate?, preferredTime?, name?, phone? }
- */
-const leadIntakeByJid = new Map();
+/** Compatibility view of per-user Vilasa sessions (isolated by JID). */
+export const vilasaSessions = {
+  add(jid) {
+    setVilasaActive(jid, true);
+  },
+  has(jid) {
+    return isVilasaActive(jid);
+  },
+  delete(jid) {
+    setVilasaActive(jid, false);
+  },
+};
 
 /** Confirmed leads (in-memory + mirrored to vilasa-leads.json) */
 export const vilasaLeads = [];
@@ -184,11 +197,11 @@ export function listVilasaLeads() {
 }
 
 export function getLeadIntakeState(jid) {
-  return leadIntakeByJid.get(jid) || null;
+  return getLeadIntake(jid);
 }
 
 export function clearLeadIntake(jid) {
-  leadIntakeByJid.delete(jid);
+  clearUserLeadIntake(jid);
 }
 
 function brochureLinkLine() {
@@ -355,33 +368,35 @@ function mimeForImage(filePath) {
 export async function sendImageWithCaption(sock, jid, imageFileName, caption) {
   const imagePath = resolveImagePath(imageFileName);
   if (!imagePath) {
-    await sock.sendMessage(jid, { text: caption });
+    await defaultSendWithTyping(sock, jid, caption);
     return { ok: false, reason: 'missing_image', captionOnly: true };
   }
 
-  try {
-    const buffer = fs.readFileSync(imagePath);
-    await sock.sendMessage(jid, {
-      image: buffer,
-      mimetype: mimeForImage(imagePath),
-      caption: String(caption || '').slice(0, 1024),
-      fileName: path.basename(imagePath),
-    });
-    return { ok: true, image: imageFileName };
-  } catch (err) {
-    console.warn(`Vilasa image buffer send failed (${imageFileName}):`, err?.message || err);
+  return withComposing(sock, jid, async () => {
     try {
+      const buffer = fs.readFileSync(imagePath);
       await sock.sendMessage(jid, {
-        image: { url: imagePath },
+        image: buffer,
+        mimetype: mimeForImage(imagePath),
         caption: String(caption || '').slice(0, 1024),
+        fileName: path.basename(imagePath),
       });
-      return { ok: true, image: imageFileName, via: 'url' };
-    } catch (err2) {
-      console.warn(`Vilasa image url send failed (${imageFileName}):`, err2?.message || err2);
-      await sock.sendMessage(jid, { text: caption });
-      return { ok: false, reason: err2?.message || err.message, captionOnly: true };
+      return { ok: true, image: imageFileName };
+    } catch (err) {
+      console.warn(`Vilasa image buffer send failed (${imageFileName}):`, err?.message || err);
+      try {
+        await sock.sendMessage(jid, {
+          image: { url: imagePath },
+          caption: String(caption || '').slice(0, 1024),
+        });
+        return { ok: true, image: imageFileName, via: 'url' };
+      } catch (err2) {
+        console.warn(`Vilasa image url send failed (${imageFileName}):`, err2?.message || err2);
+        await sock.sendMessage(jid, { text: caption });
+        return { ok: false, reason: err2?.message || err.message, captionOnly: true };
+      }
     }
-  }
+  });
 }
 
 export function resolveVilasaSection(input) {
@@ -432,15 +447,15 @@ export function resolveVilasaSection(input) {
 
 async function startLeadIntake(sock, jid, { sendWithTyping }) {
   const section = VILASA_SECTIONS.vilasa_visit;
-  leadIntakeByJid.set(jid, { step: 'date', startedAt: new Date().toISOString() });
+  setLeadIntake(jid, { step: 'date', startedAt: new Date().toISOString() });
 
   // Location / connectivity visual, then booking prompt
   await sendImageWithCaption(sock, jid, section.image, section.text);
   console.log(`📅 Vilasa lead intake started for ${jid}`);
 }
 
-async function handleLeadIntakeStep(sock, jid, text, { sendWithTyping }) {
-  const state = leadIntakeByJid.get(jid);
+async function handleLeadIntakeStep(sock, jid, text, { sendWithTyping, tenant = null }) {
+  const state = getLeadIntake(jid);
   if (!state) return false;
 
   const reply = String(text || '').trim();
@@ -475,7 +490,7 @@ async function handleLeadIntakeStep(sock, jid, text, { sendWithTyping }) {
   if (state.step === 'date') {
     state.preferredDate = reply;
     state.step = 'time';
-    leadIntakeByJid.set(jid, state);
+    setLeadIntake(jid, state);
     await sendWithTyping(
       sock,
       jid,
@@ -490,7 +505,7 @@ async function handleLeadIntakeStep(sock, jid, text, { sendWithTyping }) {
   if (state.step === 'time') {
     state.preferredTime = reply;
     state.step = 'contact';
-    leadIntakeByJid.set(jid, state);
+    setLeadIntake(jid, state);
     await sendWithTyping(
       sock,
       jid,
@@ -503,7 +518,7 @@ async function handleLeadIntakeStep(sock, jid, text, { sendWithTyping }) {
   }
 
   if (state.step === 'contact') {
-    const parsed = parseNameAndPhone(reply);
+    const parsed = parseContactDetails(reply);
     state.name = parsed.name;
     state.phone = parsed.phone;
     state.rawContact = reply;
@@ -526,6 +541,22 @@ async function handleLeadIntakeStep(sock, jid, text, { sendWithTyping }) {
     persistLeads();
     clearLeadIntake(jid);
 
+    await captureLead({
+      tenant,
+      sock,
+      customerJid: jid,
+      customerName: lead.name,
+      customerPhone: lead.phone,
+      details: {
+        preferredDate: lead.preferredDate,
+        preferredTime: lead.preferredTime,
+        project: 'Vilasa',
+        rawContact: reply,
+        source: 'vilasa_site_visit',
+      },
+      source: 'vilasa_site_visit',
+    });
+
     console.log(
       `✅ Vilasa site-visit lead: ${lead.name || 'Guest'} | ${lead.phone || 'n/a'} | ${lead.preferredDate} ${lead.preferredTime}`
     );
@@ -546,19 +577,6 @@ async function handleLeadIntakeStep(sock, jid, text, { sendWithTyping }) {
   }
 
   return false;
-}
-
-function parseNameAndPhone(text) {
-  const raw = String(text || '').trim();
-  const phoneMatch = raw.match(/(\+?\d[\d\s\-()]{8,}\d)/);
-  const phone = phoneMatch ? phoneMatch[1].replace(/[^\d+]/g, '') : '';
-  let name = raw
-    .replace(phoneMatch?.[0] || '', '')
-    .replace(/[,|]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!name || name.length < 2) name = raw;
-  return { name, phone };
 }
 
 export async function sendVilasaSection(sock, jid, section, { sendWithTyping }) {
@@ -584,7 +602,7 @@ export async function sendVilasaSection(sock, jid, section, { sendWithTyping }) 
 }
 
 export async function startVilasaDemo(sock, jid, { sendWithTyping }) {
-  vilasaSessions.add(jid);
+  setVilasaActive(jid, true);
   clearLeadIntake(jid);
   await indexVilasaKnowledge();
 
@@ -608,10 +626,10 @@ export async function startVilasaDemo(sock, jid, { sendWithTyping }) {
   return { staged: true };
 }
 
-export async function answerVilasaQuestion(question) {
+export async function answerVilasaQuestion(question, options = {}) {
   const brochureText = await loadVilasaBrochureText();
   const systemInstruction = buildVilasaSystemInstruction(brochureText);
-  return generateAiReply(question, systemInstruction);
+  return generateAiReply(question, systemInstruction, options);
 }
 
 /** Used by /demo chat tester for numbered options without WhatsApp */
@@ -625,19 +643,19 @@ export async function handleVilasaInteraction(
   sock,
   jid,
   messageText,
-  { sendWithTyping, msg = null } = {}
+  { sendWithTyping, msg = null, tenant = null } = {}
 ) {
   const text = String(messageText || '').trim();
   const selectedId = msg ? extractInteractiveSelection(msg) : null;
 
   // Active site-visit intake takes priority
-  if (leadIntakeByJid.has(jid) && text) {
-    return handleLeadIntakeStep(sock, jid, text, { sendWithTyping });
+  if (getLeadIntake(jid) && text) {
+    return handleLeadIntakeStep(sock, jid, text, { sendWithTyping, tenant });
   }
 
   // Button / list selection for Vilasa sections
   if (selectedId && String(selectedId).startsWith('vilasa_')) {
-    vilasaSessions.add(jid);
+    setVilasaActive(jid, true);
     const section = resolveVilasaSection(selectedId);
     console.log(`🏘 Vilasa section selected: ${selectedId}`);
     await sendVilasaSection(sock, jid, section, { sendWithTyping });
@@ -646,7 +664,7 @@ export async function handleVilasaInteraction(
 
   if (!text && !selectedId) return false;
 
-  const inSession = vilasaSessions.has(jid);
+  const inSession = isVilasaActive(jid);
   const trigger = isVilasaIntent(text);
 
   if (trigger) {
@@ -706,7 +724,7 @@ export async function handleVilasaInteraction(
 
   // Free-form question → AI with brochure context
   console.log(`🏘 Vilasa follow-up for ${jid}: ${text}`);
-  const reply = await answerVilasaQuestion(text);
+  const reply = await answerVilasaQuestion(text, { jid, source: 'vilasa' });
   await sendWithTyping(sock, jid, reply);
   await sendWithTyping(
     sock,

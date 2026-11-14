@@ -7,6 +7,7 @@ import {
   getActiveFileName,
   setActiveFile,
   saveUploadedBuffer,
+  saveTenantKnowledgeFile,
   loadActiveKnowledgeBase,
 } from './knowledgeManager.js';
 import { getQrState } from './qrState.js';
@@ -14,6 +15,30 @@ import { requestLogout } from './sessionControl.js';
 import { adminPageHtml } from './adminPage.js';
 import { loginPageHtml } from './loginPage.js';
 import { validateAdminCredentials, getSessionSecret } from './authConfig.js';
+import {
+  tenantLoginPage,
+  tenantRegisterPage,
+  tenantDashboardPage,
+} from './tenantPages.js';
+import {
+  createTenant,
+  authenticateTenant,
+  getPublicTenantById,
+  updateTenantSettings,
+  updateTenantKnowledge,
+  listTenantLeads,
+  listTenantsAdmin,
+  isTenantPlanActive,
+  adminUpdateTenant,
+  phoneFromJid,
+} from './db.js';
+import {
+  startTenantSession,
+  stopTenantSession,
+  getTenantQrState,
+  listWhatsAppInstances,
+} from './sessionManager.js';
+import { superAdminDashboardHtml } from './superAdminPage.js';
 import {
   getPublicAiSettings,
   setActiveModel,
@@ -27,6 +52,7 @@ import {
   initDatabase,
   upsertWebsiteKnowledge,
   listWebsiteKnowledge,
+  getTokenUsageSummary,
 } from './db.js';
 import {
   listDemoProfiles,
@@ -37,6 +63,7 @@ import {
   getLastDemoWhatsAppJid,
 } from './demoProfiles.js';
 import { listVilasaLeads } from './vilasaDemo.js';
+import { leadsToCsv } from './leadCapture.js';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -154,7 +181,8 @@ function qrPageHtml() {
     <p class="hint" id="hint">Open this page on your computer and scan from your phone.</p>
     <div class="links">
       <a href="/knowledge">Knowledge upload</a>
-      <a href="/admin">AI Settings</a>
+      <a href="/admin/dashboard">Tenants</a>
+      <a href="/admin/ai">AI Settings</a>
       <a href="/demo">Website Demo</a>
     </div>
   </main>
@@ -238,7 +266,7 @@ code{background:#f4f4f4;padding:2px 6px;border-radius:4px}
 a{color:#0b6bcb}
 .nav{display:flex;gap:14px;margin-bottom:12px;flex-wrap:wrap}
 </style></head><body>
-<div class="nav"><a href="/">QR Login</a><a href="/knowledge">Knowledge</a><a href="/admin">AI Settings</a><a href="/demo">Website Demo</a><a href="/logout">Logout</a></div>
+<div class="nav"><a href="/">QR Login</a><a href="/knowledge">Knowledge</a><a href="/admin/dashboard">Tenants</a><a href="/admin/ai">AI Settings</a><a href="/demo">Website Demo</a><a href="/logout">Logout</a></div>
 <h1>Knowledge Base Upload</h1>
 <p>Drop a <code>.txt</code>, <code>.pdf</code>, or <code>.docx</code> file for Gemini.</p>
 <div class="card">
@@ -277,18 +305,25 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     })
   );
 
-  function requireAuth(req, res, next) {
-    if (req.session?.authenticated) return next();
-
-    const wantsJson =
+  function wantsJson(req) {
+    return (
       req.path.startsWith('/api/') ||
       req.path.endsWith('.json') ||
       req.xhr ||
-      (req.headers.accept || '').includes('application/json');
+      (req.headers.accept || '').includes('application/json')
+    );
+  }
 
-    if (wantsJson) {
-      return res.status(401).json({ error: 'Unauthorized. Please login.' });
-    }
+  function requireOperator(req, res, next) {
+    if (req.session?.authenticated) return next();
+    if (req.session?.tenantId && req.path === '/') return res.redirect('/dashboard');
+    if (wantsJson(req)) return res.status(401).json({ error: 'Unauthorized. Please login.' });
+    return res.redirect('/operator');
+  }
+
+  function requireTenant(req, res, next) {
+    if (req.session?.tenantId) return next();
+    if (wantsJson(req)) return res.status(401).json({ error: 'Unauthorized. Please login.' });
     return res.redirect('/login');
   }
 
@@ -297,17 +332,58 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     res.status(200).json({
       ok: true,
       service: 'wbot',
-      routes: ['/', '/login', '/knowledge', '/admin', '/demo'],
+      routes: ['/login', '/register', '/dashboard', '/operator', '/admin/dashboard', '/admin/ai', '/demo'],
     });
   });
 
-  // Public auth routes
+  app.get('/register', (req, res) => {
+    if (req.session?.tenantId) return res.redirect('/dashboard');
+    res.type('html').send(tenantRegisterPage());
+  });
+
+  app.post('/register', async (req, res) => {
+    try {
+      const tenant = await createTenant({
+        email: req.body?.email,
+        password: req.body?.password,
+        businessName: req.body?.business_name,
+        businessType: req.body?.business_type,
+        geminiApiKey: req.body?.gemini_api_key,
+      });
+      req.session.tenantId = tenant.id;
+      req.session.tenantEmail = tenant.email;
+      return res.redirect('/dashboard');
+    } catch (err) {
+      const msg = String(err?.message || err);
+      const friendly = msg.includes('duplicate') || msg.includes('unique')
+        ? 'That email is already registered.'
+        : msg;
+      return res.status(400).type('html').send(tenantRegisterPage(friendly));
+    }
+  });
+
   app.get('/login', (req, res) => {
+    if (req.session?.tenantId) return res.redirect('/dashboard');
+    if (req.session?.authenticated) return res.redirect('/');
+    res.type('html').send(tenantLoginPage());
+  });
+
+  app.post('/login', async (req, res) => {
+    const auth = await authenticateTenant(req.body?.email, req.body?.password);
+    if (!auth) {
+      return res.status(401).type('html').send(tenantLoginPage('Invalid email or password.'));
+    }
+    req.session.tenantId = auth.public.id;
+    req.session.tenantEmail = auth.public.email;
+    return res.redirect('/dashboard');
+  });
+
+  app.get('/operator', (req, res) => {
     if (req.session?.authenticated) return res.redirect('/');
     res.type('html').send(loginPageHtml());
   });
 
-  app.post('/login', (req, res) => {
+  app.post('/operator', (req, res) => {
     const username = req.body?.username;
     const password = req.body?.password;
 
@@ -318,6 +394,111 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     req.session.authenticated = true;
     req.session.username = String(username);
     return res.redirect('/');
+  });
+
+  app.get('/dashboard', requireTenant, (_req, res) => {
+    res.type('html').send(tenantDashboardPage());
+  });
+
+  app.get('/api/tenant/me', requireTenant, async (req, res) => {
+    const tenant = await getPublicTenantById(req.session.tenantId);
+    res.json({ ok: true, tenant });
+  });
+
+  app.post('/api/tenant/settings', requireTenant, async (req, res) => {
+    try {
+      const tenant = await updateTenantSettings(req.session.tenantId, req.body || {});
+      res.json({ ok: true, tenant });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.post(
+    '/api/tenant/knowledge',
+    requireTenant,
+    upload.single('knowledge_file'),
+    async (req, res) => {
+      try {
+        const body = req.body || {};
+        let knowledgeText =
+          body.knowledge_text !== undefined ? String(body.knowledge_text) : undefined;
+        let knowledgeFilePath;
+
+        if (req.file?.buffer) {
+          const saved = await saveTenantKnowledgeFile(
+            req.session.tenantId,
+            req.file.originalname,
+            req.file.buffer
+          );
+          knowledgeFilePath = saved.path;
+          const faq = String(body.knowledge_text || '').trim();
+          knowledgeText = [faq, `===== UPLOADED DOCUMENT (${saved.filename}) =====`, saved.text]
+            .filter(Boolean)
+            .join('\n\n')
+            .slice(0, 80_000);
+        }
+
+        const tenant = await updateTenantKnowledge(req.session.tenantId, {
+          business_description: body.business_description,
+          knowledge_text: knowledgeText,
+          knowledge_file_path: knowledgeFilePath,
+        });
+        res.json({ ok: true, tenant, uploaded: Boolean(req.file) });
+      } catch (err) {
+        res.status(400).json({ ok: false, error: err.message || String(err) });
+      }
+    }
+  );
+
+  app.get('/api/tenant/qr.json', requireTenant, (req, res) => {
+    res.json(getTenantQrState(req.session.tenantId));
+  });
+
+  app.post('/api/tenant/whatsapp/start', requireTenant, async (req, res) => {
+    try {
+      await startTenantSession(req.session.tenantId);
+      res.json({ ok: true, ...getTenantQrState(req.session.tenantId) });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.get('/api/tenant/leads', requireTenant, async (req, res) => {
+    try {
+      const leads = await listTenantLeads(req.session.tenantId);
+      res.json({ ok: true, leads });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.get('/api/tenant/leads/export', requireTenant, async (req, res) => {
+    try {
+      const leads = await listTenantLeads(req.session.tenantId, { limit: 2000 });
+      const csv = leadsToCsv(leads);
+      const stamp = new Date().toISOString().slice(0, 10);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="leads-${stamp}.csv"`
+      );
+      res.send(csv);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.post('/api/tenant/whatsapp/logout', requireTenant, async (req, res) => {
+    try {
+      const result = await stopTenantSession(req.session.tenantId, {
+        logout: true,
+        restart: true,
+      });
+      res.json({ ok: true, ...result, ...getTenantQrState(req.session.tenantId) });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
   });
 
   // Session logout (destroys web login session)
@@ -335,7 +516,7 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
   });
 
   // Everything below requires login
-  app.use(requireAuth);
+  app.use(requireOperator);
 
   // Dashboard / QR UI (protected — redirects to /login if not authenticated)
   app.get('/', (_req, res) => {
@@ -366,10 +547,70 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
   app.post('/disconnect', handleWhatsAppDisconnect);
 
   app.get('/admin', (_req, res) => {
+    res.redirect('/admin/dashboard');
+  });
+  app.get('/admin/dashboard', (_req, res) => {
+    res.type('html').send(superAdminDashboardHtml());
+  });
+  app.get('/admin/ai', (_req, res) => {
     res.type('html').send(adminPageHtml());
   });
   app.get('/settings', (_req, res) => {
-    res.redirect('/admin');
+    res.redirect('/admin/ai');
+  });
+
+  app.get('/api/admin/tenants', async (_req, res) => {
+    try {
+      const tenants = await listTenantsAdmin();
+      const sessions = new Map(
+        listWhatsAppInstances().map((s) => [String(s.tenantId), s])
+      );
+      res.json({
+        ok: true,
+        tenants: tenants.map((t) => {
+          const sess = sessions.get(String(t.id));
+          const status = !isTenantPlanActive(t)
+            ? 'disabled'
+            : sess?.connectionStatus === 'connected'
+              ? 'connected'
+              : sess?.connectionStatus || 'disconnected';
+          const jid = sess?.linkedJid || t.linked_whatsapp;
+          return {
+            ...t,
+            session_status: status,
+            linked_whatsapp: jid ? phoneFromJid(jid) || jid : null,
+          };
+        }),
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.patch('/api/admin/tenants/:id', async (req, res) => {
+    try {
+      const tenant = await adminUpdateTenant(req.params.id, req.body || {});
+      if (req.body?.is_active === false) {
+        await stopTenantSession(req.params.id, { logout: false, restart: false });
+      } else if (req.body?.is_active === true || Number(req.body?.renew_days) > 0) {
+        startTenantSession(req.params.id).catch(() => {});
+      }
+      res.json({ ok: true, tenant });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.post('/api/admin/tenants/:id/disconnect', async (req, res) => {
+    try {
+      const result = await stopTenantSession(req.params.id, {
+        logout: true,
+        restart: false,
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
   });
 
   app.get('/demo', (_req, res) => {
@@ -469,6 +710,18 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
 
   app.get('/api/demo/vilasa-leads', (_req, res) => {
     res.json({ ok: true, leads: listVilasaLeads() });
+  });
+
+  app.get('/api/token-usage', async (req, res) => {
+    try {
+      const summary = await getTokenUsageSummary({
+        jid: req.query.jid || null,
+        phone: req.query.phone || null,
+      });
+      res.json({ ok: true, summary });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
   });
 
   app.get('/api/ai/settings', (_req, res) => {

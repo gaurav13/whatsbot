@@ -82,14 +82,14 @@ export function loginPageHtml(errorMessage = '') {
     <h1>Admin Login</h1>
     <p>Sign in to manage WhatsApp QR, knowledge, and AI settings.</p>
     ${errorBlock}
-    <form method="POST" action="/login">
+    <form method="POST" action="/operator">
       <label for="username">Username</label>
       <input id="username" name="username" autocomplete="username" required />
       <label for="password">Password</label>
       <input id="password" name="password" type="password" autocomplete="current-password" required />
       <button type="submit">Login</button>
     </form>
-    <p class="hint">Credentials are stored in <code>config.json</code>.</p>
+    <p class="hint">Operator credentials are stored in <code>config.json</code>.<br/>Business clients should use <a href="/login">client login</a>.</p>
   </main>
 </body>
 </html>`;

@@ -15,12 +15,12 @@ export function setLogoutInProgress(value) {
   logoutInProgress = Boolean(value);
 }
 
-export async function requestLogout() {
+export async function requestLogout(tenantId = null) {
   if (!logoutHandler) {
     throw new Error('WhatsApp socket is not ready yet');
   }
   if (logoutInProgress) {
     return { ok: true, message: 'Logout already in progress' };
   }
-  return logoutHandler();
+  return logoutHandler(tenantId);
 }
