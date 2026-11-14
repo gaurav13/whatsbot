@@ -107,6 +107,7 @@ export function adminPageHtml() {
       <a href="/">QR Login</a>
       <a href="/knowledge">Knowledge</a>
       <a href="/admin">AI Settings</a>
+      <a href="/demo">Website Demo</a>
       <a href="/logout">Logout</a>
     </div>
     <h1>Multi-AI Agent Settings</h1>

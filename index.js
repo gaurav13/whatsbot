@@ -27,6 +27,29 @@ import {
 } from './sessionControl.js';
 import { generateAiReply, peekActiveAi } from './aiRouter.js';
 import { loadAiConfig } from './aiConfigStore.js';
+import { buildWebsiteKnowledgeContext } from './db.js';
+import {
+  loadServicesCatalog,
+  getServiceByRowId,
+  findServiceByText,
+  formatServiceDetails,
+  isServicesMenuIntent,
+} from './servicesCatalog.js';
+import {
+  sendInteractiveServicesMenu,
+  extractInteractiveSelection,
+} from './whatsappInteractive.js';
+import {
+  handleVilasaInteraction,
+  indexVilasaKnowledge,
+  startVilasaDemo,
+} from './vilasaDemo.js';
+import {
+  setDemoWhatsAppTrigger,
+  getActiveDemoProfile,
+  buildDemoSystemInstruction,
+} from './demoProfiles.js';
+import { isVilasaIntent } from './vilasaDemo.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AUTH_DIR = path.join(__dirname, 'baileys_auth_info');
@@ -80,8 +103,45 @@ function getMessageText(msg) {
     msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
     msg.message?.documentWithCaptionMessage?.message?.documentMessage?.caption ||
     msg.message?.documentMessage?.caption ||
+    msg.message?.listResponseMessage?.title ||
+    msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    msg.message?.buttonsResponseMessage?.selectedDisplayText ||
+    msg.message?.templateButtonReplyMessage?.selectedDisplayText ||
     ''
   );
+}
+
+async function handleServicesInteraction(sock, jid, msg, messageText) {
+  const catalog = loadServicesCatalog();
+
+  // Button / list / native-flow selection → pricing from services.txt
+  const selectedId = extractInteractiveSelection(msg);
+  if (selectedId) {
+    const service = getServiceByRowId(selectedId, catalog);
+    const details = formatServiceDetails(service);
+    await sendWithTyping(sock, jid, details);
+    console.log(`💰 Sent pricing for ${service?.id || selectedId} to ${jid}`);
+    return true;
+  }
+
+  // Explicit menu keywords → interactive payload (with text fallback)
+  if (isServicesMenuIntent(messageText)) {
+    await sendInteractiveServicesMenu(sock, jid);
+    return true;
+  }
+
+  // Numbered reply or service-name match (from text menu fallback)
+  const matched = findServiceByText(messageText, catalog);
+  if (matched && /^(?:[1-5]\b|[a-z].{2,})$/i.test(messageText.trim())) {
+    const shortQuery = messageText.trim().split(/\s+/).length <= 6;
+    if (shortQuery) {
+      await sendWithTyping(sock, jid, formatServiceDetails(matched));
+      console.log(`💰 Sent pricing for ${matched.id} (text match) to ${jid}`);
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function isAutomationActive(jid) {
@@ -229,6 +289,12 @@ async function handleAdminDocumentUpload(sock, msg, chatJid) {
 
 async function buildSystemInstruction() {
   const kb = await loadActiveKnowledgeBase();
+  let websiteContext = '';
+  try {
+    websiteContext = await buildWebsiteKnowledgeContext(10000);
+  } catch (err) {
+    console.warn('Website DB knowledge unavailable:', err?.message || err);
+  }
 
   if (kb.error || !kb.text) {
     console.warn(`⚠️ Knowledge base issue: ${kb.error || 'empty content'}`);
@@ -237,7 +303,7 @@ async function buildSystemInstruction() {
   return [
     'You are the expert WhatsApp sales and technical consultant for GS AI Solutions (https://gsaisolutions.online/).',
     'You speak only to qualified website/portfolio inbound leads.',
-    'Answer ONLY using the active knowledge document below.',
+    'Answer using the active knowledge document and any scraped website knowledge below.',
     'If a detail is missing, say you will confirm with the GS AI Solutions team — never invent prices, metrics, guarantees, or unlisted services.',
     'Keep replies concise, professional, consultative, and WhatsApp-friendly. Use short bullets when helpful.',
     '',
@@ -246,6 +312,10 @@ async function buildSystemInstruction() {
       kb.error ||
       'No knowledge content loaded. Ask for project details and offer to connect with the GS AI Solutions team at https://gsaisolutions.online/.',
     '===== END KNOWLEDGE BASE =====',
+    '',
+    '===== SCRAPED WEBSITE KNOWLEDGE (POSTGRES) =====',
+    websiteContext || 'No scraped website knowledge stored yet.',
+    '===== END SCRAPED WEBSITE KNOWLEDGE =====',
   ].join('\n');
 }
 
@@ -267,12 +337,13 @@ async function sendWithTyping(sock, jid, text) {
 }
 
 async function getAiReply(userQuery) {
-  const systemInstruction = await buildSystemInstruction();
+  const demo = getActiveDemoProfile();
+  const built = await buildDemoSystemInstruction(demo.id);
   const active = peekActiveAi();
   console.log(
-    `🤖 Asking AI for reply via ${active.activeProvider}/${active.activeModel} (kb=${getActiveFileName()})`
+    `🤖 Asking AI via ${active.activeProvider}/${active.activeModel} · demo=${demo.id} · kb=${built.knowledgeSource || getActiveFileName()}`
   );
-  return generateAiReply(userQuery, systemInstruction);
+  return generateAiReply(userQuery, built.systemInstruction);
 }
 
 let currentSock = null;
@@ -334,16 +405,32 @@ async function logoutAndReset() {
   }
 }
 
+let reconnectTimer = null;
+
 async function startSock() {
   if (sockBootPromise) return sockBootPromise;
 
   sockBootPromise = (async () => {
+  // Close any previous socket so we never run two sessions on one auth folder
+  if (currentSock) {
+    try {
+      currentSock.ev?.removeAllListeners?.();
+      currentSock.end?.(undefined);
+    } catch {
+      // ignore
+    }
+    currentSock = null;
+    await sleep(500);
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
   const sock = makeWASocket({
     auth: state,
     logger: baileysLogger,
-    printQRInTerminal: true,
+    printQRInTerminal: false,
+    markOnlineOnConnect: false,
+    syncFullHistory: false,
   });
   currentSock = sock;
 
@@ -380,27 +467,37 @@ async function startSock() {
       }
 
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      clearQr(shouldReconnect ? 'reconnecting' : 'logged_out');
-      console.log('Connection closed. Reconnecting...', shouldReconnect);
-      if (shouldReconnect) {
-        currentSock = null;
-        startSock();
-      } else {
-        console.log('Logged out remotely. Clearing session and waiting for fresh QR…');
-        currentSock = null;
+      const loggedOut = statusCode === DisconnectReason.loggedOut;
+      clearQr(loggedOut ? 'logged_out' : 'reconnecting');
+      console.log(
+        `Connection closed (code=${statusCode ?? 'n/a'}). Reconnecting…`,
+        !loggedOut
+      );
+
+      if (currentSock === sock) currentSock = null;
+
+      if (loggedOut) {
         try {
           clearAuthSession();
         } catch {
           // ignore
         }
-        startSock();
       }
+
+      // Debounced single reconnect — avoids multi-socket auth conflicts
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        startSock().catch((err) =>
+          console.error('Reconnect failed:', err?.message || err)
+        );
+      }, 2500);
     } else if (connection === 'open') {
       clearQr('connected');
       console.log('✅ WhatsApp successfully connected on Localhost!');
       console.log(`📂 Knowledge folder: ${KNOWLEDGE_DIR}`);
       console.log(`📌 Active knowledge file: ${getActiveFileName() || '(none)'}`);
+      console.log(`🎬 Active demo profile: ${getActiveDemoProfile().id}`);
     }
   });
 
@@ -429,8 +526,9 @@ async function startSock() {
     }
 
     const senderJid = chatJid;
+    const selectedId = extractInteractiveSelection(msg);
     const messageText = getMessageText(msg);
-    if (!messageText.trim()) return;
+    if (!messageText.trim() && !selectedId) return;
 
     // Per-chat automation gate
     if (!isAutomationActive(senderJid)) {
@@ -440,26 +538,59 @@ async function startSock() {
 
     const isTracked = trackedUsers.has(senderJid);
     const isLead = isPortfolioLeadMessage(messageText);
+    const vilasaIntent = isVilasaIntent(messageText);
+    const servicesIntent = isServicesMenuIntent(messageText);
+    const demoStart =
+      /^(demo|start|hi|hello|menu)$/i.test(String(messageText || '').trim());
 
-    // Website-only filter: ignore non-portfolio strangers completely
-    if (!isTracked && !isLead) {
-      console.log(`🔇 Ignored (no portfolio trigger): ${senderJid}`);
+    // Allow portfolio leads, demo intents, and already-tracked chats
+    if (!isTracked && !isLead && !selectedId && !vilasaIntent && !servicesIntent && !demoStart) {
+      console.log(`🔇 Ignored (no portfolio/demo trigger): ${senderJid}`);
       return;
     }
 
-    console.log(`📩 Message from ${senderJid}: ${messageText}`);
+    console.log(
+      `📩 Message from ${senderJid}: ${messageText || '(interactive)'}${selectedId ? ` [${selectedId}]` : ''}`
+    );
 
     try {
-      // First portfolio message → welcome + unlock session
+      // First message → unlock session and start ACTIVE demo welcome
       if (!isTracked) {
         trackedUsers.add(senderJid);
         automationEnabled.set(senderJid, true);
-        console.log(`👋 Portfolio lead ${senderJid} — sending welcome`);
-        await sendWithTyping(sock, senderJid, WELCOME_MESSAGE);
+        const demo = getActiveDemoProfile();
+        console.log(`👋 New chat ${senderJid} — starting demo: ${demo.id}`);
+
+        if (demo.id === 'vilasa' || vilasaIntent) {
+          await startVilasaDemo(sock, senderJid, { sendWithTyping });
+          return;
+        }
+
+        await sendWithTyping(
+          sock,
+          senderJid,
+          `${WELCOME_MESSAGE}\n\nPlease choose a service, or type *services* for the pricing menu.`
+        );
+        await sendInteractiveServicesMenu(sock, senderJid);
         return;
       }
 
-      // Follow-ups → active AI provider + selected knowledge file
+      // Vilasa staged property demo (intro + buttons → targeted replies)
+      if (
+        await handleVilasaInteraction(sock, senderJid, messageText, {
+          sendWithTyping,
+          msg,
+        })
+      ) {
+        return;
+      }
+
+      // Interactive services menu / pricing (before AI)
+      if (await handleServicesInteraction(sock, senderJid, msg, messageText)) {
+        return;
+      }
+
+      // Follow-ups → active demo knowledge
       const reply = await getAiReply(messageText);
       await sendWithTyping(sock, senderJid, reply);
       console.log(`✅ Replied to ${senderJid}`);
@@ -486,6 +617,65 @@ async function startSock() {
 }
 
 setLogoutHandler(logoutAndReset);
+
+setDemoWhatsAppTrigger(async ({ profileId, jid }) => {
+  const sock = currentSock;
+  if (!sock) {
+    return { ok: false, error: 'WhatsApp is not connected yet' };
+  }
+
+  const cleanJid = String(jid || '').trim();
+  if (!cleanJid.includes('@')) {
+    return { ok: false, error: 'Invalid WhatsApp JID' };
+  }
+
+  trackedUsers.add(cleanJid);
+  automationEnabled.set(cleanJid, true);
+
+  if (profileId === 'vilasa') {
+    await startVilasaDemo(sock, cleanJid, { sendWithTyping });
+    return { ok: true, profileId, jid: cleanJid, mode: 'vilasa' };
+  }
+
+  await sendWithTyping(
+    sock,
+    cleanJid,
+    '👋 *Welcome to GS AI Solutions*\n\nWe help businesses grow with WhatsApp automation, digital marketing, and full-stack web development.\n\nPlease choose a service to view pricing:'
+  );
+  await sendInteractiveServicesMenu(sock, cleanJid);
+  return { ok: true, profileId, jid: cleanJid, mode: 'gsai' };
+});
+
 startKnowledgeServer();
+
+// Preload Vilasa brochure into txt + Supabase (non-blocking)
+indexVilasaKnowledge()
+  .then(() => console.log('🏡 Vilasa brochure indexed for demo'))
+  .catch((err) => console.warn('Vilasa preload skipped:', err?.message || err));
+
+// Baileys may throw after a closed socket (retry while reconnecting).
+// Log and ignore — connection.update already schedules a single reconnect.
+process.on('uncaughtException', (err) => {
+  const msg = String(err?.message || err || '');
+  if (
+    msg.includes('Connection Closed') ||
+    msg.includes('Timed Out') ||
+    msg.includes('Precondition Required')
+  ) {
+    console.warn('⚠️ Ignored socket exception (reconnect in progress):', msg);
+    return;
+  }
+  console.error('uncaughtException:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  const msg = String(reason?.message || reason || '');
+  if (msg.includes('Connection Closed') || msg.includes('Timed Out')) {
+    console.warn('⚠️ Ignored socket rejection:', msg);
+    return;
+  }
+  console.error('unhandledRejection:', reason);
+});
+
 startSock();
 

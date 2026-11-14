@@ -21,6 +21,22 @@ import {
   loadAiConfig,
 } from './aiConfigStore.js';
 import { peekActiveAi } from './aiRouter.js';
+import { demoPageHtml } from './demoPage.js';
+import { scrapeWebsite } from './websiteScraper.js';
+import {
+  initDatabase,
+  upsertWebsiteKnowledge,
+  listWebsiteKnowledge,
+} from './db.js';
+import {
+  listDemoProfiles,
+  getActiveDemoProfile,
+  getDemoWelcomePreview,
+  triggerDemoProfile,
+  answerDemoChat,
+  getLastDemoWhatsAppJid,
+} from './demoProfiles.js';
+import { listVilasaLeads } from './vilasaDemo.js';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -139,6 +155,7 @@ function qrPageHtml() {
     <div class="links">
       <a href="/knowledge">Knowledge upload</a>
       <a href="/admin">AI Settings</a>
+      <a href="/demo">Website Demo</a>
     </div>
   </main>
   <script>
@@ -221,7 +238,7 @@ code{background:#f4f4f4;padding:2px 6px;border-radius:4px}
 a{color:#0b6bcb}
 .nav{display:flex;gap:14px;margin-bottom:12px;flex-wrap:wrap}
 </style></head><body>
-<div class="nav"><a href="/">QR Login</a><a href="/knowledge">Knowledge</a><a href="/admin">AI Settings</a><a href="/logout">Logout</a></div>
+<div class="nav"><a href="/">QR Login</a><a href="/knowledge">Knowledge</a><a href="/admin">AI Settings</a><a href="/demo">Website Demo</a><a href="/logout">Logout</a></div>
 <h1>Knowledge Base Upload</h1>
 <p>Drop a <code>.txt</code>, <code>.pdf</code>, or <code>.docx</code> file for Gemini.</p>
 <div class="card">
@@ -236,7 +253,12 @@ a{color:#0b6bcb}
 }
 
 export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
+  const host = process.env.HOST || '0.0.0.0';
   const app = express();
+
+  // Required behind Nginx so secure cookies / client IP work correctly
+  app.set('trust proxy', 1);
+
   app.use(express.json());
   app.use(express.urlencoded({ extended: false }));
   app.use(
@@ -248,7 +270,8 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
       cookie: {
         httpOnly: true,
         sameSite: 'lax',
-        secure: process.env.NODE_ENV === 'production',
+        // Use Secure cookies when served over HTTPS (Nginx TLS)
+        secure: process.env.COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production',
         maxAge: 1000 * 60 * 60 * 12, // 12 hours
       },
     })
@@ -268,6 +291,15 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     }
     return res.redirect('/login');
   }
+
+  // Public health check (no auth) — use this to verify Nginx -> Node
+  app.get('/health', (_req, res) => {
+    res.status(200).json({
+      ok: true,
+      service: 'wbot',
+      routes: ['/', '/login', '/knowledge', '/admin', '/demo'],
+    });
+  });
 
   // Public auth routes
   app.get('/login', (req, res) => {
@@ -305,6 +337,7 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
   // Everything below requires login
   app.use(requireAuth);
 
+  // Dashboard / QR UI (protected — redirects to /login if not authenticated)
   app.get('/', (_req, res) => {
     res.type('html').send(qrPageHtml());
   });
@@ -337,6 +370,105 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
   });
   app.get('/settings', (_req, res) => {
     res.redirect('/admin');
+  });
+
+  app.get('/demo', (_req, res) => {
+    res.type('html').send(demoPageHtml());
+  });
+
+  app.get('/api/demo/profiles', async (_req, res) => {
+    try {
+      const active = getActiveDemoProfile();
+      const preview = await getDemoWelcomePreview(active.id);
+      res.json({
+        ok: true,
+        profiles: listDemoProfiles(),
+        activeProfileId: active.id,
+        preview,
+        lastWhatsAppJid: getLastDemoWhatsAppJid(),
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.post('/api/demo/profile', async (req, res) => {
+    try {
+      const profileId = req.body?.profileId;
+      if (!profileId) {
+        return res.status(400).json({ error: 'profileId is required' });
+      }
+
+      const result = await triggerDemoProfile(profileId, {
+        pushToWhatsAppJid: req.body?.pushToWhatsAppJid || null,
+        trigger: req.body?.trigger !== false,
+      });
+
+      res.json({
+        ok: true,
+        profile: result.profile,
+        preview: result.preview,
+        whatsapp: result.whatsapp,
+        lastWhatsAppJid: result.lastWhatsAppJid || getLastDemoWhatsAppJid(),
+        triggered: req.body?.trigger !== false,
+      });
+    } catch (err) {
+      console.error('demo profile activate failed:', err?.message || err);
+      res.status(400).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.post('/api/scrape-and-store', async (req, res) => {
+    try {
+      const scraped = await scrapeWebsite(req.body?.url);
+      const saved = await upsertWebsiteKnowledge({
+        url: scraped.url,
+        title: scraped.title,
+        content: scraped.content,
+      });
+
+      res.json({
+        ok: true,
+        status: 'stored',
+        id: saved.id,
+        url: saved.url,
+        title: saved.title,
+        contentLength: saved.content_length,
+        wordCount: saved.word_count,
+        preview: scraped.preview,
+      });
+    } catch (err) {
+      console.error('scrape-and-store failed:', err?.message || err);
+      res.status(400).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.get('/api/website-knowledge', async (_req, res) => {
+    try {
+      const items = await listWebsiteKnowledge(25);
+      res.json({ ok: true, items });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.post('/api/demo/chat', async (req, res) => {
+    try {
+      const question = String(req.body?.question || '').trim();
+      if (!question) {
+        return res.status(400).json({ error: 'question is required' });
+      }
+
+      const result = await answerDemoChat(question, req.body?.profileId);
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      console.error('demo chat failed:', err?.message || err);
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.get('/api/demo/vilasa-leads', (_req, res) => {
+    res.json({ ok: true, leads: listVilasaLeads() });
   });
 
   app.get('/api/ai/settings', (_req, res) => {
@@ -437,12 +569,30 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     }
   });
 
-  const server = app.listen(port, () => {
-    console.log(`🌐 Web UI: http://localhost:${port}`);
-    console.log(`📷 WhatsApp QR page: http://localhost:${port}/`);
-    console.log(`📚 Knowledge upload: http://localhost:${port}/knowledge`);
-    console.log(`⚙️  AI Settings: http://localhost:${port}/admin`);
+  // Keep connections from dying silently on handler errors
+  app.use((err, _req, res, _next) => {
+    console.error('Express error:', err?.stack || err);
+    if (res.headersSent) return;
+    res.status(500).type('html').send('<h1>Server error</h1><p>Check PM2 logs.</p>');
+  });
+
+  initDatabase().catch((err) => {
+    console.error('DB init failed:', err?.message || err);
+  });
+
+  const server = app.listen(port, host, () => {
+    console.log(`🌐 Web UI bound on http://${host}:${port}`);
+    console.log(`📷 WhatsApp QR page: http://127.0.0.1:${port}/`);
+    console.log(`🔐 Login page: http://127.0.0.1:${port}/login`);
+    console.log(`❤️  Health: http://127.0.0.1:${port}/health`);
+    console.log(`🧪 Website Demo: http://127.0.0.1:${port}/demo`);
+    console.log(`📚 Knowledge upload: http://127.0.0.1:${port}/knowledge`);
+    console.log(`⚙️  AI Settings: http://127.0.0.1:${port}/admin`);
     console.log(`📂 Knowledge folder: ${KNOWLEDGE_DIR}`);
+  });
+
+  server.on('error', (err) => {
+    console.error(`HTTP server failed to bind ${host}:${port}:`, err.message);
   });
 
   return server;

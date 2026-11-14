@@ -1,268 +1,67 @@
-# GS AI Solutions — Professional Services Knowledge Base
-# Website: https://gsaisolutions.online/
-# Edit this file anytime. The bot reloads it on every Gemini reply.
+# GS AI Solutions — Services & Pricing Catalog
+# Edit anytime. The bot reloads this file on each request.
 
-## Agency Identity
-Agency name: GS AI Solutions
-Website: https://gsaisolutions.online/
-Role of this assistant: Expert sales / technical consultant for inbound website & portfolio WhatsApp leads.
-Mission: Help businesses grow with SEO, paid ads, AI automation, intelligent agents, full-stack products, Web3 systems, and secure cloud infrastructure.
-Tone: Professional, confident, consultative, concise (WhatsApp-friendly). Prefer short paragraphs and bullets.
-Hard rule: Answer ONLY from this knowledge base. If a detail is missing (exact price, SLA, or unlisted capability), say you will confirm with the GS AI Solutions team — never invent facts, guarantees, or fixed prices.
+## Digital Marketing
+id: digital-marketing
+description: Full-funnel digital marketing to grow leads, traffic, and revenue — SEO, content, funnels, analytics, and conversion optimization.
+pricing:
+- Starter Plan: ₹14,999 / month (audit + channel setup + monthly reporting)
+- Growth Plan: ₹29,999 / month (multi-channel campaigns + landing pages + weekly optimization)
+- Performance Plan: ₹49,999 / month (aggressive scaling + funnel CRO + dedicated strategist)
+includes:
+- Strategy & KPI planning
+- Campaign setup and monitoring
+- Monthly performance report
+notes: Final quote depends on ad spend, markets, and number of channels.
 
-## Who We Serve
-- Startups and founders launching MVPs or AI-powered products
-- Local and national businesses needing leads, SEO, and ads
-- Real-estate / service businesses needing high-converting Meta lead funnels
-- Agencies and operators needing WhatsApp AI agents and workflow automation
-- Teams needing custom web apps, WordPress/Shopify stores, or Web3 products
-- Companies needing cloud deployment, security hardening, and ongoing maintenance
+## WhatsApp Marketing
+id: whatsapp-marketing
+description: WhatsApp broadcast, chatbot automation, lead qualification, and AI reply agents for sales and support.
+pricing:
+- Setup (one-time): ₹19,999 (bot flow + templates + knowledge base setup)
+- Starter Automation: ₹9,999 / month (up to 1,500 conversations)
+- Business Automation: ₹24,999 / month (AI replies + CRM sync + multi-agent flows)
+includes:
+- Interactive service menu / quick replies
+- Auto-qualification and handoff to human
+- Campaign broadcasts (as per WhatsApp policy)
+notes: Meta/WhatsApp business approval and template costs are separate if required.
 
-## Core USP
-Business & AI Automation — especially custom WhatsApp AI agents (Baileys + Node.js + Gemini) triggered from website lead links, plus n8n workflow automation on cloud infrastructure, CRM sync, and intelligent outreach.
+## Facebook Marketing
+id: facebook-marketing
+description: Meta Ads (Facebook + Instagram) for lead generation, retargeting, creative testing, and funnel management.
+pricing:
+- Campaign Setup: ₹7,999 one-time
+- Managed Ads (Starter): ₹14,999 / month + ad spend
+- Managed Ads (Growth): ₹29,999 / month + ad spend
+includes:
+- Audience research & offer packaging
+- Ad creatives/copy testing plan
+- Pixel/CAPI checks and weekly optimization
+notes: Ad spend is paid directly to Meta and is not included in management fees.
 
-================================================================================
-1) SEARCH ENGINE OPTIMIZATION (SEO) & VISIBILITY
-================================================================================
+## Web Application Development
+id: web-application
+description: Custom full-stack web apps using React/Next.js, Node.js, APIs, dashboards, auth, and database systems.
+pricing:
+- MVP Starter: from ₹49,999 (basic app / admin panel)
+- Business App: from ₹99,999 (multi-module product)
+- Enterprise Build: custom quote (complex workflows, integrations, scale)
+includes:
+- UI/UX implementation
+- Backend API + database
+- Deployment & basic documentation
+notes: Timeline typically 2–6+ weeks depending on scope.
 
-### Technical SEO
-- Crawlability & indexability audits (robots.txt, sitemap.xml, canonicals, redirects)
-- Site architecture, internal linking strategy, and orphan-page cleanup
-- Core Web Vitals / page experience diagnostics
-- Structured data (JSON-LD schema) for rich results where relevant
-- HTTPS, HSTS, mixed-content, and crawl-budget improvements
-- Log-aware recommendations for large sites when available
-
-### On-Page SEO
-- Keyword research, intent mapping, and content briefs
-- Title tags, meta descriptions, H1–H3 hierarchy, and URL structure
-- Content optimization for informational, commercial, and transactional queries
-- Image SEO (alt text, compression, modern formats)
-- Thin/duplicate content remediation and topical cluster planning
-
-### Off-Page SEO
-- Authority-building outreach and digital PR support
-- Brand mention / citation consistency improvements
-- Competitor backlink gap analysis (high-level strategy)
-- Reputation and entity signals for local and national brands
-
-### Local SEO
-- Google Business Profile optimization and posting cadence guidance
-- NAP consistency across directories
-- Local landing pages, service-area pages, and review acquisition systems
-- Local pack / Maps visibility strategy for multi-location businesses
-
-### Programmatic & Technical Growth Ops
-- Bulk Google index checking scripts / monitoring workflows
-- Programmatic rank tracking setups (keyword groups, competitors, locations)
-- Automated SEO reporting pipelines (rank, traffic, conversions)
-- Site speed optimization: caching, image/CDN strategy, code splitting, lazy loading, server response tuning
-- Indexing issue triage (coverage errors, soft 404s, blocked resources)
-
-### SEO Deliverables (typical)
-- Technical audit + prioritized roadmap
-- On-page implementation plan
-- Content / keyword strategy
-- Rank tracking dashboard setup
-- Monthly retainers for continuous optimization
-
-================================================================================
-2) DIGITAL MARKETING & PAID ADS
-================================================================================
-
-### Meta Ads Manager (Facebook / Instagram)
-- Full-funnel campaign architecture: awareness → consideration → conversion
-- Real-estate and service-business lead generation (example vertical: Vilasa-style property lead gen)
-- High-converting ad copy frameworks (hooks, offers, proof, CTA)
-- Creative testing plans (static, carousel, video, UGC-style concepts)
-- Audience targeting: lookalikes, interest stacks, retargeting, exclusion audiences
-- Pixel / CAPI event hygiene guidance and conversion tracking checks
-- Budget pacing, bid strategy selection, and creative fatigue management
-- Funnel management: landing page → lead form / WhatsApp → CRM → sales follow-up
-
-### Social Media Growth & Brand Positioning
-- Profile positioning, messaging pillars, and content calendars
-- Organic growth systems aligned with paid acquisition
-- Brand voice guidelines for founders and local businesses
-- Lead magnet / offer packaging for social-to-WhatsApp conversion
-
-### Paid Ads Outcomes We Optimize For
-- Cost per lead (CPL), lead quality, booked calls, and sales-ready conversations
-- Creative win-rate and landing-page conversion rate
-- Retargeting efficiency and pipeline handoff quality
-
-================================================================================
-3) BUSINESS & AI AUTOMATION (CORE USP)
-================================================================================
-
-### Custom WhatsApp AI Automation Agents
-- Website-triggered WhatsApp lead agents using Baileys + Node.js + Google Gemini API
-- Portfolio / website link filters so automation only engages qualified inbound visitors
-- Welcome flows, qualification questions, FAQ handling, and appointment/lead capture
-- Human-like typing delays, session memory, and knowledge-base-driven replies
-- Multi-step conversation design for sales, support, and project intake
-- Handoff to human agents when required
-
-### Workflow Automation (n8n + Cloud)
-- n8n automation deployed on cloud infrastructure (including Oracle Cloud)
-- Automated lead generation pipelines
-- CRM integrations (sync leads, tags, statuses, notes)
-- Outreach sequences and follow-up cadences
-- Google X-Ray search strings for prospecting / research-assisted outreach workflows
-- Webhook-driven systems connecting forms, WhatsApp, email, sheets, and CRMs
-- Error handling, retries, logging, and operational monitoring for production workflows
-
-### Business Process Automation Examples
-- Inbound lead → WhatsApp AI qualify → CRM create/update → notify sales team
-- Form submit → enrichment → personalized outreach sequence
-- Missed-call / inactive-lead nurture automations
-- Reporting digests (daily/weekly) to founders or ops teams
-
-================================================================================
-4) AI AGENTS & INTELLIGENT SYSTEMS
-================================================================================
-
-### LLM & API Integrations
-- OpenAI ChatGPT API
-- Google Gemini API
-- Anthropic Claude
-- Groq (low-latency inference use cases)
-- Multi-model routing strategies (cost / speed / quality tradeoffs)
-
-### RAG & Knowledge Systems
-- Custom vector databases (Pinecone and similar architectures)
-- Retrieval-Augmented Generation (RAG) for company docs, FAQs, catalogs, SOPs
-- Chunking, embedding, metadata filters, and citation-friendly answer design
-- Private knowledge bases for internal teams or customer-facing assistants
-
-### Intelligent Agent Capabilities
-- Tool-using agents for research, lead qualification, and support deflection
-- Domain specialists (sales, support, onboarding, SEO reporting assistants)
-- Memory strategies for multi-turn conversations
-- Guardrails: brand tone, allowed topics, escalation rules
-- Evaluation loops for answer quality and hallucination reduction
-
-### AI Product Use Cases
-- Website chat agents and WhatsApp business agents
-- Internal knowledge copilots for teams
-- Document Q&A for policies, catalogs, and technical manuals
-- Automated content drafting assistants with human review checkpoints
-
-================================================================================
-5) FULL-STACK WEB & APPLICATION DEVELOPMENT
-================================================================================
-
-### Modern Custom Web Applications
-- React.js, Next.js, Node.js, Express.js, TypeScript, Tailwind CSS
-- PostgreSQL and MongoDB data layers
-- Auth systems, role-based access, dashboards, and admin panels
-- REST APIs, third-party integrations, webhooks, and background jobs
-- Responsive UI/UX, performance optimization, and production deployments
-- MVP → scale path for startups and SMBs
-
-### CMS, PHP & E-commerce
-- WordPress site builds, theme customization, plugin architecture, and performance hardening
-- PHP development including CodeIgniter applications
-- Shopify e-commerce store setup, theme customization, app/integrations, and conversion UX
-- Secure hosting / cPanel management, domain/DNS support, and migration assistance
-
-### Web Product Types We Build
-- Marketing websites and high-converting landing pages
-- SaaS dashboards and internal tools
-- Booking / lead / CRM-adjacent portals
-- AI-enabled web apps and automation control panels
-- E-commerce storefronts and catalog experiences
-
-================================================================================
-6) WEB3 & BLOCKCHAIN SOLUTIONS
-================================================================================
-
-### Decentralized Application Development
-- dApp frontends with wallet connection UX
-- Smart contract integration and on-chain interaction flows
-- Non-custodial exchange architecture patterns
-- Escrow systems for trust-minimized transactions
-- Token / asset UX, transaction status handling, and error recovery UX
-
-### Supported Ecosystems
-- Internet Computer Protocol (ICP)
-- XRP Ledger
-- Solana
-- EVM-compatible networks (Ethereum and compatible chains)
-
-### Web3 Engagement Focus
-- Secure architecture guidance (non-custodial principles, least-privilege design)
-- Practical product delivery: wallets, escrow, exchange-adjacent flows, and dashboards
-- Clear scope around audits: recommend independent security review for high-value contracts when needed
-
-================================================================================
-7) INFRASTRUCTURE & SECURITY
-================================================================================
-
-### Cloud Deployment
-- Oracle Cloud VPS deployments
-- DigitalOcean droplets / app platforms
-- Vercel for frontend / Next.js workloads
-- Environment separation (dev/staging/production) when required
-
-### Process & Reliability
-- PM2 process management for Node.js services
-- Reverse proxy / routing setups as needed
-- Automated database backups and restore planning
-- Logging, uptime awareness, and restart policies
-
-### Security Hardening
-- Cloudflare WAF setup and bot/abuse mitigation baselines
-- SSL certificates and HTTPS enforcement
-- Firewall / access control hygiene for VPS environments
-- Secrets management practices (env files, least exposure)
-- Secure cPanel / hosting administration for WordPress and PHP stacks
-
-### Ops Support
-- Deployments, rollbacks, dependency updates
-- Monitoring basics and incident response playbooks
-- Performance tuning for apps under real traffic
-
-================================================================================
-ENGAGEMENT PROCESS
-================================================================================
-1. Discovery — goals, current stack, KPIs, constraints, deadline
-2. Scope & proposal — deliverables, timeline, assumptions, investment range
-3. Build / launch — iterative delivery with demos and feedback loops
-4. Optimize — ads, SEO, automation, conversion, and reliability improvements
-5. Retain / support — optional retainers for growth, maintenance, and iteration
-
-## Typical Timeline Guidance (scope-dependent)
-- SEO technical audit + roadmap: a few days to 1–2 weeks
-- Meta Ads campaign setup + creative testing start: 3–10 days
-- WhatsApp AI agent (website-triggered): about 3–10 days
-- n8n automation + CRM pipeline: about 3–14 days
-- Custom full-stack MVP: about 2–6+ weeks
-- WordPress / Shopify store setup: about 1–3 weeks
-- Web3 dApp / escrow / wallet flows: about 1–4+ weeks
-- Cloud deploy + Cloudflare/SSL/PM2 hardening: about 1–7 days
-
-## Pricing Guidance
-- All work is primarily project-based or retainer-based depending on ongoing needs
-- Exact pricing depends on scope, integrations, urgency, and complexity
-- Never invent fixed final prices in chat
-- Ask for: project type, goals, current tools, deadline, and approximate budget
-- Offer a short discovery call / WhatsApp qualification with the GS AI Solutions team
-
-## Qualification Questions (use 1–3 as needed)
-1. What are you trying to achieve (leads, sales, automation, product build, SEO, ads, Web3)?
-2. Do you already have a website, CRM, ads account, or existing tech stack?
-3. What is your ideal timeline and approximate budget range?
-4. Should replies stay on WhatsApp, or do you also need CRM / dashboard / website changes?
-
-## Call to Action
-Guide qualified leads to:
-- Share project goals and constraints
-- Visit https://gsaisolutions.online/ for positioning and portfolio context
-- Continue on WhatsApp for scoping, then schedule a detailed discussion with the GS AI Solutions team
-
-## Things This Assistant Must NOT Do
-- Invent case-study metrics, guarantees, or legal/financial claims
-- Discuss unrelated personal/political topics
-- Bypass the website-lead context (this channel is for website/portfolio inbound leads)
-- Quote exact final prices without confirming with the team
+## Website Design & Development
+id: website-design
+description: High-converting business websites, landing pages, WordPress/Shopify sites, and redesigns with SEO-ready structure.
+pricing:
+- Landing Page: from ₹9,999
+- Business Website (upto 5 pages): from ₹19,999
+- Premium Website / Redesign: from ₹39,999
+includes:
+- Mobile-responsive design
+- Contact/lead forms
+- Basic SEO setup and speed optimization
+notes: Domain, hosting, and premium plugins/themes are billed separately when applicable.
