@@ -4,7 +4,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE IF NOT EXISTS tenants (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  email TEXT NOT NULL UNIQUE,
+  email TEXT UNIQUE,
   password_hash TEXT NOT NULL,
   business_name TEXT NOT NULL,
   business_type TEXT NOT NULL DEFAULT 'it_services',
@@ -28,6 +28,25 @@ ALTER TABLE tenants ADD COLUMN IF NOT EXISTS alert_phone TEXT;
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS ai_provider TEXT NOT NULL DEFAULT 'deepseek';
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS ai_model TEXT;
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS custom_api_key TEXT;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS phone TEXT;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS business_category TEXT;
+ALTER TABLE tenants ALTER COLUMN email DROP NOT NULL;
+UPDATE tenants
+SET phone = COALESCE(
+  NULLIF(phone, ''),
+  NULLIF(regexp_replace(COALESCE(linked_whatsapp, ''), '\D', '', 'g'), ''),
+  'pending-' || substring(id::text, 1, 8)
+)
+WHERE phone IS NULL OR phone = '';
+UPDATE tenants
+SET business_category = CASE
+  WHEN business_type = 'real_estate' THEN 'real_estate'
+  ELSE COALESCE(NULLIF(business_category, ''), 'general')
+END
+WHERE business_category IS NULL OR business_category = '';
+ALTER TABLE tenants ALTER COLUMN phone SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS tenants_phone_uidx ON tenants (phone);
+CREATE UNIQUE INDEX IF NOT EXISTS tenants_email_uidx ON tenants (email) WHERE email IS NOT NULL AND email <> '';
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS quota_reset_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '30 days');

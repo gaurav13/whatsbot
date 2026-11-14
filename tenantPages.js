@@ -1,4 +1,5 @@
 import { TENANT_AI_PROVIDERS, MODEL_CATALOG } from './aiConfigStore.js';
+import { BUSINESS_CATEGORIES } from './tenantCatalog.js';
 
 function escapeHtml(value) {
   return String(value || '')
@@ -54,7 +55,8 @@ export function tenantLoginPage(errorMessage = '') {
       <p class="sub">Sign in to connect WhatsApp and manage your AI keys.</p>
       ${error}
       <form method="post" action="/login">
-        <label>Email</label><input name="email" type="email" required />
+        <label>Phone or email</label>
+        <input name="login" required placeholder="Phone number or email" autocomplete="username" />
         <label>Password</label><input name="password" type="password" required />
         <div class="row"><button type="submit">Sign in</button></div>
       </form>
@@ -72,13 +74,20 @@ export function tenantRegisterPage(errorMessage = '') {
       <p class="sub">Each business gets an isolated WhatsApp session and token quota.</p>
       ${error}
       <form method="post" action="/register">
-        <label>Business name</label><input name="business_name" required placeholder="Vilasa Homes" />
-        <label>Email</label><input name="email" type="email" required />
-        <label>Password</label><input name="password" type="password" minlength="8" required />
-        <label>Business profile</label>
-        <select name="business_type">
-          <option value="real_estate">Real Estate</option>
-          <option value="it_services" selected>IT & Agency Services</option>
+        <label>Business name</label>
+        <input name="business_name" required placeholder="Vilasa Homes" />
+        <label>Phone number</label>
+        <input name="phone" type="tel" required placeholder="9876543210" inputmode="tel" />
+        <label>Email (optional)</label>
+        <input name="email" type="email" placeholder="you@business.com" />
+        <label>Password</label>
+        <input name="password" type="password" minlength="8" required />
+        <label>Business category</label>
+        <select name="business_category" required>
+          ${BUSINESS_CATEGORIES.map(
+            (c) =>
+              `<option value="${escapeHtml(c.id)}"${c.id === 'general' ? ' selected' : ''}>${escapeHtml(c.label)}</option>`
+          ).join('')}
         </select>
         <label>Gemini API key (optional — leave blank to use platform quota)</label>
         <input name="gemini_api_key" placeholder="AIza..." />
@@ -100,10 +109,13 @@ export function tenantDashboardPage() {
       <div class="card">
         <h2 style="margin:0 0 10px;font-size:1.05rem">1) Business & API keys</h2>
         <label>Business name</label><input id="businessName" />
-        <label>Profile</label>
-        <select id="businessType">
-          <option value="real_estate">Real Estate (Vilasa-style flow)</option>
-          <option value="it_services">IT & Agency Services</option>
+        <label>Phone number</label><input id="phone" type="tel" required />
+        <label>Email (optional)</label><input id="email" type="email" />
+        <label>Business category</label>
+        <select id="businessCategory">
+          ${BUSINESS_CATEGORIES.map(
+            (c) => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)}</option>`
+          ).join('')}
         </select>
         <label>AI provider</label>
         <select id="aiProvider">
@@ -184,9 +196,12 @@ export function tenantDashboardPage() {
         const data = await res.json();
         const t = data.tenant;
         document.getElementById('biz').textContent = t.business_name;
-        document.getElementById('meta').textContent = t.email + ' · ' + t.business_type;
+        document.getElementById('meta').textContent =
+          (t.phone || '') + (t.email ? ' · ' + t.email : '') + ' · ' + (t.business_category || t.business_type);
         document.getElementById('businessName').value = t.business_name;
-        document.getElementById('businessType').value = t.business_type;
+        document.getElementById('phone').value = t.phone || '';
+        document.getElementById('email').value = t.email || '';
+        document.getElementById('businessCategory').value = t.business_category || 'general';
         document.getElementById('aiProvider').value = t.ai_provider || 'deepseek';
         document.getElementById('aiModel').value = t.ai_model || '';
         document.getElementById('keyMeta').textContent = t.has_custom_api_key
@@ -218,7 +233,9 @@ export function tenantDashboardPage() {
       document.getElementById('saveBtn').onclick = async () => {
         const body = {
           business_name: document.getElementById('businessName').value,
-          business_type: document.getElementById('businessType').value,
+          phone: document.getElementById('phone').value,
+          email: document.getElementById('email').value,
+          business_category: document.getElementById('businessCategory').value,
           alert_phone: document.getElementById('alertPhone').value,
           ai_provider: document.getElementById('aiProvider').value,
           ai_model: document.getElementById('aiModel').value

@@ -341,24 +341,50 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     res.type('html').send(tenantRegisterPage());
   });
 
+  function registerPayload(body = {}) {
+    return {
+      email: body.email,
+      phone: body.phone,
+      password: body.password,
+      businessName: body.business_name || body.businessName,
+      businessCategory: body.business_category || body.businessCategory,
+      businessType: body.business_type,
+      geminiApiKey: body.gemini_api_key,
+    };
+  }
+
+  function registerErrorMessage(err) {
+    const msg = String(err?.message || err);
+    if (/tenants_phone|phone/i.test(msg) && /duplicate|unique/i.test(msg)) {
+      return 'That phone number is already registered.';
+    }
+    if (/email/i.test(msg) && /duplicate|unique/i.test(msg)) {
+      return 'That email is already registered.';
+    }
+    return msg;
+  }
+
   app.post('/register', async (req, res) => {
     try {
-      const tenant = await createTenant({
-        email: req.body?.email,
-        password: req.body?.password,
-        businessName: req.body?.business_name,
-        businessType: req.body?.business_type,
-        geminiApiKey: req.body?.gemini_api_key,
-      });
+      const tenant = await createTenant(registerPayload(req.body || {}));
       req.session.tenantId = tenant.id;
       req.session.tenantEmail = tenant.email;
+      req.session.tenantPhone = tenant.phone;
       return res.redirect('/dashboard');
     } catch (err) {
-      const msg = String(err?.message || err);
-      const friendly = msg.includes('duplicate') || msg.includes('unique')
-        ? 'That email is already registered.'
-        : msg;
-      return res.status(400).type('html').send(tenantRegisterPage(friendly));
+      return res.status(400).type('html').send(tenantRegisterPage(registerErrorMessage(err)));
+    }
+  });
+
+  app.post('/api/register', async (req, res) => {
+    try {
+      const tenant = await createTenant(registerPayload(req.body || {}));
+      req.session.tenantId = tenant.id;
+      req.session.tenantEmail = tenant.email;
+      req.session.tenantPhone = tenant.phone;
+      res.json({ ok: true, tenant });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: registerErrorMessage(err) });
     }
   });
 
@@ -369,12 +395,16 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
   });
 
   app.post('/login', async (req, res) => {
-    const auth = await authenticateTenant(req.body?.email, req.body?.password);
+    const auth = await authenticateTenant(
+      req.body?.login || req.body?.email || req.body?.phone,
+      req.body?.password
+    );
     if (!auth) {
-      return res.status(401).type('html').send(tenantLoginPage('Invalid email or password.'));
+      return res.status(401).type('html').send(tenantLoginPage('Invalid phone, email, or password.'));
     }
     req.session.tenantId = auth.public.id;
     req.session.tenantEmail = auth.public.email;
+    req.session.tenantPhone = auth.public.phone;
     return res.redirect('/dashboard');
   });
 
@@ -583,6 +613,7 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
         }),
       });
     } catch (err) {
+      console.error('GET /api/admin/tenants failed:', err);
       res.status(500).json({ ok: false, error: err.message || String(err) });
     }
   });

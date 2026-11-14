@@ -75,6 +75,13 @@ export function loginPageHtml(errorMessage = '') {
       font-size: .92rem;
     }
     .hint { margin-top: 14px; font-size: .82rem; color: var(--muted); }
+    .hint a {
+      color: #7dd3fc;
+      font-weight: 650;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    .hint a:hover { color: #bae6fd; }
   </style>
 </head>
 <body>

@@ -2,6 +2,12 @@ import dns from 'dns/promises';
 import pg from 'pg';
 import 'dotenv/config';
 import { hashPassword, verifyPassword, encryptSecret, decryptSecret, maskSecret } from './tenantCrypto.js';
+import {
+  normalizeBusinessCategory,
+  businessTypeFromCategory,
+  assertValidPhone,
+  normalizeOptionalEmail,
+} from './tenantCatalog.js';
 
 const { Pool } = pg;
 
@@ -181,6 +187,34 @@ export async function initDatabase() {
   );
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS ai_model TEXT;`);
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS custom_api_key TEXT;`);
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS phone TEXT;`);
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS business_category TEXT;`);
+  await pool.query(`ALTER TABLE tenants ALTER COLUMN email DROP NOT NULL;`);
+  await pool.query(`
+    UPDATE tenants
+    SET phone = COALESCE(
+      NULLIF(phone, ''),
+      NULLIF(regexp_replace(COALESCE(linked_whatsapp, ''), '\\D', '', 'g'), ''),
+      'pending-' || substring(id::text, 1, 8)
+    )
+    WHERE phone IS NULL OR phone = '';
+  `);
+  await pool.query(`
+    UPDATE tenants
+    SET business_category = CASE
+      WHEN business_type = 'real_estate' THEN 'real_estate'
+      ELSE COALESCE(NULLIF(business_category, ''), 'general')
+    END
+    WHERE business_category IS NULL OR business_category = '';
+  `);
+  await pool.query(`ALTER TABLE tenants ALTER COLUMN phone SET NOT NULL;`);
+  await pool.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS tenants_phone_uidx ON tenants (phone);`
+  );
+  await pool.query(`ALTER TABLE tenants DROP CONSTRAINT IF EXISTS tenants_email_key;`);
+  await pool.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS tenants_email_uidx ON tenants (email) WHERE email IS NOT NULL AND email <> '';`
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tenant_leads (
@@ -517,9 +551,11 @@ function publicTenant(row) {
   const groq = decryptSecret(row.groq_api_key);
   return {
     id: row.id,
-    email: row.email,
+    email: row.email || '',
+    phone: row.phone || '',
     business_name: row.business_name,
     business_type: row.business_type,
+    business_category: row.business_category || 'general',
     token_quota: row.token_quota,
     tokens_used: row.tokens_used,
     message_quota: Number(row.message_quota) || 1000,
@@ -562,9 +598,11 @@ export function getTenantSecrets(row) {
 
 export async function createTenant({
   email,
+  phone,
   password,
   businessName,
   businessType = 'it_services',
+  businessCategory = null,
   geminiApiKey = null,
   groqApiKey = null,
   tokenQuota = 50000,
@@ -572,18 +610,34 @@ export async function createTenant({
 }) {
   const pool = await getPool();
   if (!pool) throw new Error('Database is not configured');
+
+  const name = String(businessName || '').trim();
+  if (!name) throw new Error('Business name is required.');
+  if (!String(password || '') || String(password).length < 8) {
+    throw new Error('Password must be at least 8 characters.');
+  }
+
+  const phoneNorm = assertValidPhone(phone);
+  const emailNorm = normalizeOptionalEmail(email);
+  const category = normalizeBusinessCategory(
+    businessCategory || (businessType === 'real_estate' ? 'real_estate' : 'general')
+  );
+  const type = businessTypeFromCategory(category);
+
   const result = await pool.query(
     `
     INSERT INTO tenants
-      (email, password_hash, business_name, business_type, gemini_api_key, groq_api_key, token_quota, is_platform, is_active, quota_reset_at, plan_expires_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, NOW(), $9)
+      (email, phone, password_hash, business_name, business_type, business_category, gemini_api_key, groq_api_key, token_quota, is_platform, is_active, quota_reset_at, plan_expires_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, NOW(), $11)
     RETURNING *;
     `,
     [
-      String(email || '').trim().toLowerCase(),
+      emailNorm,
+      phoneNorm,
       hashPassword(password),
-      String(businessName || '').trim(),
-      businessType === 'real_estate' ? 'real_estate' : 'it_services',
+      name,
+      type,
+      category,
       encryptSecret(geminiApiKey),
       encryptSecret(groqApiKey),
       Number(tokenQuota) || 50000,
@@ -594,12 +648,22 @@ export async function createTenant({
   return publicTenant(result.rows[0]);
 }
 
-export async function authenticateTenant(email, password) {
+export async function authenticateTenant(identifier, password) {
   const pool = await getPool();
   if (!pool) return null;
-  const result = await pool.query(`SELECT * FROM tenants WHERE email = $1 LIMIT 1`, [
-    String(email || '').trim().toLowerCase(),
-  ]);
+  const raw = String(identifier || '').trim();
+  if (!raw) return null;
+  const email = raw.toLowerCase();
+  const phone = raw.replace(/\D/g, '');
+  const result = await pool.query(
+    `
+    SELECT * FROM tenants
+    WHERE (email IS NOT NULL AND email <> '' AND lower(email) = $1)
+       OR ($2 <> '' AND (phone = $2 OR right(regexp_replace(phone, '\\D', '', 'g'), 10) = right($2, 10)))
+    LIMIT 1
+    `,
+    [email, phone]
+  );
   const row = result.rows[0];
   if (!row || !verifyPassword(password, row.password_hash)) return null;
   if (row.is_active === false) return null;
@@ -621,12 +685,21 @@ export async function updateTenantSettings(id, patch = {}) {
   const current = await getTenantById(id);
   if (!current) throw new Error('Tenant not found');
 
-  const businessType =
-    patch.businessType === 'real_estate' || patch.business_type === 'real_estate'
-      ? 'real_estate'
-      : patch.businessType === 'it_services' || patch.business_type === 'it_services'
-        ? 'it_services'
-        : current.business_type;
+  const category =
+    patch.business_category !== undefined || patch.businessCategory !== undefined
+      ? normalizeBusinessCategory(patch.business_category ?? patch.businessCategory)
+      : normalizeBusinessCategory(
+          current.business_category ||
+            (current.business_type === 'real_estate' ? 'real_estate' : 'general')
+        );
+  const businessType = businessTypeFromCategory(category);
+
+  const phone =
+    patch.phone !== undefined
+      ? assertValidPhone(patch.phone)
+      : current.phone;
+  const email =
+    patch.email !== undefined ? normalizeOptionalEmail(patch.email) : current.email;
 
   const gemini =
     patch.geminiApiKey === undefined && patch.gemini_api_key === undefined
@@ -666,12 +739,15 @@ export async function updateTenantSettings(id, patch = {}) {
     UPDATE tenants
     SET business_name = $2,
         business_type = $3,
-        gemini_api_key = $4,
-        groq_api_key = $5,
-        alert_phone = $6,
-        ai_provider = $7,
-        ai_model = $8,
-        custom_api_key = $9
+        business_category = $4,
+        phone = $5,
+        email = $6,
+        gemini_api_key = $7,
+        groq_api_key = $8,
+        alert_phone = $9,
+        ai_provider = $10,
+        ai_model = $11,
+        custom_api_key = $12
     WHERE id = $1
     RETURNING *;
     `,
@@ -679,6 +755,9 @@ export async function updateTenantSettings(id, patch = {}) {
       id,
       businessName,
       businessType,
+      category,
+      phone,
+      email,
       gemini,
       groq,
       alertPhone || null,
@@ -741,27 +820,11 @@ export async function setTenantLinkedWhatsapp(tenantId, jid) {
 export async function listTenantsAdmin() {
   const pool = await getPool();
   if (!pool) return [];
-  const result = await pool.query(`
+  let result;
+  try {
+    result = await pool.query(`
     SELECT
-      t.id,
-      t.email,
-      t.business_name,
-      t.business_type,
-      t.token_quota,
-      t.tokens_used,
-      t.message_quota,
-      t.messages_used,
-      t.is_platform,
-      t.is_active,
-      t.quota_reset_at,
-      t.plan_expires_at,
-      t.linked_whatsapp,
-      t.created_at,
-      t.gemini_api_key,
-      t.groq_api_key,
-      t.ai_provider,
-      t.ai_model,
-      t.custom_api_key,
+      t.*,
       COALESCE(u.prompt_tokens, 0)::int AS prompt_tokens,
       COALESCE(u.reply_tokens, 0)::int AS reply_tokens,
       COALESCE(u.total_tokens, 0)::int AS usage_total_tokens,
@@ -781,18 +844,40 @@ export async function listTenantsAdmin() {
     ) u ON u.tenant_id = t.id
     ORDER BY t.created_at DESC
   `);
+  } catch (err) {
+    console.error('listTenantsAdmin query failed:', err);
+    throw err;
+  }
 
   return result.rows.map((row) => {
-    const gemini = decryptSecret(row.gemini_api_key);
-    const groq = decryptSecret(row.groq_api_key);
+    let gemini = null;
+    let groq = null;
+    let custom = null;
+    try {
+      gemini = decryptSecret(row.gemini_api_key);
+    } catch {
+      gemini = null;
+    }
+    try {
+      groq = decryptSecret(row.groq_api_key);
+    } catch {
+      groq = null;
+    }
+    try {
+      custom = decryptSecret(row.custom_api_key);
+    } catch {
+      custom = null;
+    }
     const quota = Number(row.token_quota) || 0;
     const usedCounter = Number(row.tokens_used) || 0;
     const burned = Number(row.usage_total_tokens) || 0;
     return {
       id: row.id,
       email: row.email,
+      phone: row.phone || '',
       business_name: row.business_name,
       business_type: row.business_type,
+      business_category: row.business_category || 'general',
       is_platform: row.is_platform,
       is_active: row.is_active !== false,
       quota_reset_at: row.quota_reset_at || null,
@@ -808,11 +893,11 @@ export async function listTenantsAdmin() {
         0,
         (Number(row.message_quota) || 1000) - (Number(row.messages_used) || 0)
       ),
-      api_key_type: gemini || groq || decryptSecret(row.custom_api_key) ? 'BYOK' : 'MASTER',
+      api_key_type: gemini || groq || custom ? 'BYOK' : 'MASTER',
       has_gemini_key: Boolean(gemini),
       has_groq_key: Boolean(groq),
-      has_custom_api_key: Boolean(decryptSecret(row.custom_api_key)),
-      custom_api_key_masked: maskSecret(decryptSecret(row.custom_api_key)),
+      has_custom_api_key: Boolean(custom),
+      custom_api_key_masked: maskSecret(custom),
       ai_provider: row.ai_provider || 'deepseek',
       ai_model: row.ai_model || '',
       prompt_tokens: row.prompt_tokens || 0,
@@ -1098,9 +1183,11 @@ export async function ensurePlatformTenant() {
   const password = process.env.PLATFORM_TENANT_PASSWORD || 'change-me-platform';
   const created = await createTenant({
     email,
+    phone: process.env.PLATFORM_TENANT_PHONE || '910000000000',
     password,
     businessName: process.env.PLATFORM_BUSINESS_NAME || 'GS AI Platform',
     businessType: 'it_services',
+    businessCategory: 'it_software',
     tokenQuota: Number(process.env.PLATFORM_TOKEN_QUOTA) || 1000000,
     isPlatform: true,
   });
