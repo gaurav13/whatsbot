@@ -1,0 +1,16 @@
+{
+  "updatedAt": "2026-11-14T10:13:59.337Z",
+  "leads": [
+    {
+      "id": "lead_1794651239337",
+      "jid": "259575072706763@lid",
+      "preferredDate": "4",
+      "preferredTime": "1 pm",
+      "name": "Deepak sharma",
+      "phone": "8284891236",
+      "rawContact": "Deepak sharma 8284891236",
+      "project": "Vilasa",
+      "createdAt": "2026-11-14T10:13:59.337Z"
+    }
+  ]
+}

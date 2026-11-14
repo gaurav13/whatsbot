@@ -13,6 +13,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const VILASA_DOCX = path.join(__dirname, 'knowledge', 'VILASA_Brochure.docx');
 export const VILASA_TXT = path.join(__dirname, 'knowledge', 'vilasa-brochure.txt');
 export const VILASA_IMAGES_DIR = path.join(__dirname, 'knowledge', 'vilasa-image');
+export const VILASA_BROCHURE_URL =
+  'https://drive.google.com/file/d/1IZiAg40P7lIsLwE9npCo1Z_nx4iFn27I/view?usp=sharing';
 const LEADS_PATH = path.join(__dirname, 'vilasa-leads.json');
 
 /** Users currently in the Vilasa real-estate demo conversation */
@@ -189,6 +191,10 @@ export function clearLeadIntake(jid) {
   leadIntakeByJid.delete(jid);
 }
 
+function brochureLinkLine() {
+  return `📄 *Brochure:* ${VILASA_BROCHURE_URL}`;
+}
+
 function formatNumberedMenu() {
   return [
     'Please reply with a *number*:',
@@ -199,6 +205,8 @@ function formatNumberedMenu() {
     '4️⃣ *Schedule a Site Visit*',
     '',
     '_Just send 1, 2, 3, or 4_',
+    'Type *brochure* to get the full project PDF.',
+    brochureLinkLine(),
   ].join('\n');
 }
 
@@ -271,6 +279,7 @@ export function buildVilasaSystemInstruction(brochureText) {
     'Answer ONLY using the brochure knowledge below.',
     'Known starting price: ₹1.37 crore for 3 BHK. Do not invent other exact prices.',
     'When helpful, gently guide the user to reply 1 (price), 2 (amenities), 3 (floor plans), or 4 (site visit).',
+    `Share the official brochure link whenever asked: ${VILASA_BROCHURE_URL}`,
     'Keep replies concise and WhatsApp-friendly.',
     '',
     '===== VILASA BROCHURE KNOWLEDGE =====',
@@ -286,7 +295,9 @@ export function getVilasaIntroMessage() {
     '📍 *Sector 6, South Gurugram* — an exclusive new address\n' +
     '🏠 Spacious *3 BHK* homes crafted for refined living\n' +
     '💵 Starting at *₹1.37 Crore*\n' +
-    '🏛 25,000 sq ft clubhouse · lush greens · premium connectivity\n\n' +
+    '🏛 25,000 sq ft clubhouse · lush greens · premium connectivity\n' +
+    brochureLinkLine() +
+    '\n\n' +
     'I’d be delighted to personally guide you through the project.\n\n' +
     formatNumberedMenu()
   );
@@ -659,22 +670,28 @@ export async function handleVilasaInteraction(
 
   const lower = text.toLowerCase();
 
-  // Brochure download
+  // Brochure link + optional document
   if (/\bbrochure\b/.test(lower)) {
+    await sendWithTyping(
+      sock,
+      jid,
+      '📄 *VILASA Project Brochure*\n\n' +
+        'Here is the official brochure for your review:\n' +
+        `${VILASA_BROCHURE_URL}\n\n` +
+        'When you’re ready, reply *4* to schedule a private site visit — or *menu* to explore more.'
+    );
     if (fs.existsSync(VILASA_DOCX)) {
-      await sock.sendMessage(jid, {
-        document: { url: VILASA_DOCX },
-        mimetype:
-          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        fileName: 'VILASA_Brochure.docx',
-        caption:
-          '📄 *VILASA Project Brochure*\n\nI’ve shared the full document for your review. When you’re ready, reply *4* to schedule a private site visit — or *menu* to explore more.',
-      });
-    } else {
-      const summary = await answerVilasaQuestion(
-        'Summarize the full Vilasa brochure highlights for a WhatsApp buyer in under 160 words. Include starting price ₹1.37 crore for 3 BHK.'
-      );
-      await sendWithTyping(sock, jid, summary);
+      try {
+        await sock.sendMessage(jid, {
+          document: { url: VILASA_DOCX },
+          mimetype:
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          fileName: 'VILASA_Brochure.docx',
+          caption: `📄 Also attached. Online copy: ${VILASA_BROCHURE_URL}`,
+        });
+      } catch (err) {
+        console.warn('Vilasa brochure file send skipped:', err?.message || err);
+      }
     }
     return true;
   }
