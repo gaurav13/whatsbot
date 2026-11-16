@@ -5,12 +5,13 @@ import makeWASocket, { DisconnectReason } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrcodeTerminal from 'qrcode-terminal';
 import QRCode from 'qrcode';
-import { loadBaileysAuthState } from './baileysAuthStore.js';
+import { loadBaileysAuthState, tenantHasRegisteredAuth } from './baileysAuthStore.js';
 import {
   getTenantById,
   baileysAuthClearAll,
   setTenantLinkedWhatsapp,
   isTenantPlanActive,
+  listTenantIdsWithBaileysCreds,
 } from './db.js';
 import { attachWhatsAppHandler, pushTenantWelcome } from './whatsappHandler.js';
 import { setQr, clearQr, setConnectionStatus } from './qrState.js';
@@ -92,13 +93,19 @@ export function getSock(tenantId) {
   return instances.get(String(tenantId))?.sock || null;
 }
 
-export async function startTenantSession(tenantId, { syncGlobalQr = false } = {}) {
+export async function startTenantSession(
+  tenantId,
+  { syncGlobalQr = false, allowQr = true, silent = false } = {}
+) {
   const id = String(tenantId);
   let inst = instances.get(id);
   if (!inst) {
     inst = blankInstance(id);
     instances.set(id, inst);
   }
+  inst.syncGlobalQr = Boolean(syncGlobalQr);
+  inst.allowQr = allowQr !== false;
+  inst.silent = Boolean(silent);
   if (inst.bootPromise) return inst.bootPromise;
 
   inst.bootPromise = (async () => {
@@ -122,7 +129,7 @@ export async function startTenantSession(tenantId, { syncGlobalQr = false } = {}
     }
     const folder = authFolder(id);
     fs.mkdirSync(folder, { recursive: true });
-    const auth = await loadBaileysAuthState(folder, id);
+    const auth = await loadBaileysAuthState(folder, id, { silent: inst.silent });
 
     const sock = makeWASocket({
       auth: auth.state,
@@ -136,7 +143,7 @@ export async function startTenantSession(tenantId, { syncGlobalQr = false } = {}
     inst.sock = sock;
     inst.connectionStatus = 'connecting';
     inst.lastUpdated = new Date().toISOString();
-    if (syncGlobalQr) setConnectionStatus('connecting');
+    if (inst.syncGlobalQr) setConnectionStatus('connecting');
 
     sock.ev.on('creds.update', auth.saveCreds);
 
@@ -144,8 +151,25 @@ export async function startTenantSession(tenantId, { syncGlobalQr = false } = {}
       try {
       const { connection, lastDisconnect, qr } = update;
       if (qr) {
-        console.log(`\n📷 Tenant ${id} — scan WhatsApp QR at /dashboard\n`);
-        if (syncGlobalQr) qrcodeTerminal.generate(qr, { small: true });
+        if (!inst.allowQr) {
+          inst.skipReconnect = true;
+          inst.qrDataUrl = null;
+          inst.connectionStatus = 'needs_scan';
+          inst.lastUpdated = new Date().toISOString();
+          try {
+            sock.end?.(undefined);
+          } catch {
+            // ignore
+          }
+          if (inst.sock === sock) inst.sock = null;
+          return;
+        }
+        if (!inst.silent) {
+          console.log(`📷 Tenant ${id} — scan WhatsApp QR at /dashboard`);
+        }
+        if (inst.syncGlobalQr && !inst.silent) {
+          qrcodeTerminal.generate(qr, { small: true });
+        }
         try {
           inst.qrDataUrl = await QRCode.toDataURL(qr, {
             errorCorrectionLevel: 'M',
@@ -154,7 +178,7 @@ export async function startTenantSession(tenantId, { syncGlobalQr = false } = {}
           });
           inst.connectionStatus = 'waiting_for_scan';
           inst.lastUpdated = new Date().toISOString();
-          if (syncGlobalQr) setQr(qr, inst.qrDataUrl);
+          if (inst.syncGlobalQr) setQr(qr, inst.qrDataUrl);
         } catch (err) {
           console.error('QR render failed:', err?.message || err);
         }
@@ -162,7 +186,7 @@ export async function startTenantSession(tenantId, { syncGlobalQr = false } = {}
 
       if (connection === 'connecting') {
         inst.connectionStatus = 'connecting';
-        if (syncGlobalQr) setConnectionStatus('connecting');
+        if (inst.syncGlobalQr) setConnectionStatus('connecting');
       }
 
       if (connection === 'close') {
@@ -171,20 +195,29 @@ export async function startTenantSession(tenantId, { syncGlobalQr = false } = {}
           inst.qrDataUrl = null;
           return;
         }
+        if (inst.skipReconnect) {
+          inst.skipReconnect = false;
+          inst.connectionStatus = 'needs_scan';
+          inst.qrDataUrl = null;
+          if (inst.sock === sock) inst.sock = null;
+          return;
+        }
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const loggedOut = statusCode === DisconnectReason.loggedOut;
         const replaced = statusCode === DisconnectReason.connectionReplaced;
         inst.connectionStatus = loggedOut ? 'logged_out' : 'reconnecting';
         inst.qrDataUrl = null;
         inst.lastUpdated = new Date().toISOString();
-        if (syncGlobalQr) clearQr(inst.connectionStatus);
+        if (inst.syncGlobalQr) clearQr(inst.connectionStatus);
         if (inst.sock === sock) inst.sock = null;
-        console.warn(
-          `🔌 Tenant ${id} disconnected (${disconnectLabel(statusCode)})` +
-            (lastDisconnect?.error?.message
-              ? ` — ${redactSecrets(lastDisconnect.error.message)}`
-              : '')
-        );
+        if (!inst.silent) {
+          console.warn(
+            `🔌 Tenant ${id} disconnected (${disconnectLabel(statusCode)})` +
+              (lastDisconnect?.error?.message
+                ? ` — ${redactSecrets(lastDisconnect.error.message)}`
+                : '')
+          );
+        }
 
         if (loggedOut) {
           try {
@@ -193,6 +226,8 @@ export async function startTenantSession(tenantId, { syncGlobalQr = false } = {}
           } catch {
             // ignore
           }
+          inst.connectionStatus = 'logged_out';
+          return;
         }
 
         if (inst.reconnectTimer) clearTimeout(inst.reconnectTimer);
@@ -207,11 +242,20 @@ export async function startTenantSession(tenantId, { syncGlobalQr = false } = {}
               inst.connectionStatus = 'disabled';
               return;
             }
-            await startTenantSession(id, { syncGlobalQr });
+            await startTenantSession(id, {
+              syncGlobalQr: inst.syncGlobalQr,
+              allowQr: inst.allowQr,
+              silent: inst.silent,
+            });
           } catch (err) {
             console.error(`Reconnect failed for tenant ${id}:`, redactSecrets(err));
             inst.reconnectTimer = setTimeout(
-              () => startTenantSession(id, { syncGlobalQr }).catch(() => {}),
+              () =>
+                startTenantSession(id, {
+                  syncGlobalQr: inst.syncGlobalQr,
+                  allowQr: inst.allowQr,
+                  silent: inst.silent,
+                }).catch(() => {}),
               reconnectDelayMs(inst.reconnectAttempt++)
             );
           }
@@ -225,7 +269,7 @@ export async function startTenantSession(tenantId, { syncGlobalQr = false } = {}
         if (inst.linkedJid) {
           setTenantLinkedWhatsapp(id, inst.linkedJid).catch(() => {});
         }
-        if (syncGlobalQr) clearQr('connected');
+        if (inst.syncGlobalQr) clearQr('connected');
         console.log(`✅ WhatsApp connected for tenant ${id} (${tenant?.business_name || 'n/a'})`);
       }
       } catch (err) {
@@ -245,7 +289,11 @@ export async function startTenantSession(tenantId, { syncGlobalQr = false } = {}
       if (inst.reconnectTimer) clearTimeout(inst.reconnectTimer);
       inst.reconnectTimer = setTimeout(() => {
         inst.reconnectTimer = null;
-        startTenantSession(id, { syncGlobalQr }).catch((e) =>
+        startTenantSession(id, {
+          syncGlobalQr: inst.syncGlobalQr,
+          allowQr: inst.allowQr,
+          silent: inst.silent,
+        }).catch((e) =>
           console.error(`Reconnect failed for tenant ${id}:`, redactSecrets(e))
         );
       }, delay);
@@ -306,9 +354,62 @@ export async function stopTenantSession(
   inst.loggingOut = false;
   if (restart) {
     await sleep(400);
-    await startTenantSession(id);
+    await startTenantSession(id, { allowQr: true });
   }
   return { ok: true, message: logout ? 'Logged out. Scan a new QR to reconnect.' : 'Stopped' };
+}
+
+export async function restoreAuthenticatedSessions() {
+  const fromDb = await listTenantIdsWithBaileysCreds().catch(() => []);
+  const fromDisk = [];
+  const root = path.join(__dirname, 'baileys_auth_info');
+  try {
+    if (fs.existsSync(root)) {
+      for (const name of fs.readdirSync(root)) {
+        const folder = path.join(root, name);
+        if (fs.statSync(folder).isDirectory()) fromDisk.push(name);
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  const ids = [...new Set([...fromDb, ...fromDisk])];
+  const restore = [];
+  for (const id of ids) {
+    const ok = await tenantHasRegisteredAuth(id, authFolder(id));
+    if (ok) restore.push(id);
+  }
+
+  if (!restore.length) {
+    console.log('♻️ No saved WhatsApp sessions to restore — tenants can scan QR from /dashboard');
+    return { restored: 0 };
+  }
+
+  console.log(`♻️ Restoring ${restore.length} saved WhatsApp session(s) in the background…`);
+  for (const id of restore) {
+    startTenantSession(id, { allowQr: false, silent: true }).catch((err) =>
+      console.warn(`Silent restore skipped for ${id}:`, redactSecrets(err))
+    );
+    await sleep(1200);
+  }
+  return { restored: restore.length };
+}
+
+export async function destroyTenantRuntime(tenantId) {
+  const id = String(tenantId);
+  try {
+    await stopTenantSession(id, { logout: true, restart: false });
+  } catch (err) {
+    console.warn(`destroyTenantRuntime stop skipped:`, err?.message || err);
+  }
+  instances.delete(id);
+  try {
+    fs.rmSync(authFolder(id), { recursive: true, force: true });
+  } catch {
+    // ignore
+  }
+  return { ok: true };
 }
 
 export async function sendTenantDemo(tenantId, jid) {

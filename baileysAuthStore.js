@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import {
   initAuthCreds,
   BufferJSON,
@@ -91,18 +93,49 @@ export async function usePostgresAuthState(tenantId = null) {
   };
 }
 
-export async function loadBaileysAuthState(fileFolder, tenantId = null) {
+function credsLookRegistered(creds) {
+  return Boolean(creds?.me?.id || creds?.me?.jid || creds?.registered);
+}
+
+export async function tenantHasRegisteredAuth(tenantId, fileFolder = null) {
+  try {
+    const value = await baileysAuthRead('creds', tenantId);
+    if (value) {
+      const creds = deserialize(value);
+      if (credsLookRegistered(creds)) return true;
+    }
+  } catch {
+    // fall through to files
+  }
+
+  if (fileFolder) {
+    try {
+      const credsPath = path.join(fileFolder, 'creds.json');
+      if (fs.existsSync(credsPath)) {
+        const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+        return credsLookRegistered(creds);
+      }
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+export async function loadBaileysAuthState(fileFolder, tenantId = null, { silent = false } = {}) {
   try {
     const pgState = await usePostgresAuthState(tenantId);
     if (pgState) {
-      console.log(`🔐 Baileys auth: PostgreSQL tenant=${tenantId || 'legacy'}`);
+      if (!silent) console.log(`🔐 Baileys auth: PostgreSQL tenant=${tenantId || 'legacy'}`);
       return pgState;
     }
   } catch (err) {
-    console.warn('Postgres Baileys auth unavailable, using files:', err?.message || err);
+    if (!silent) {
+      console.warn('Postgres Baileys auth unavailable, using files:', err?.message || err);
+    }
   }
 
   const fileState = await useMultiFileAuthState(fileFolder);
-  console.log(`🔐 Baileys auth: local folder ${fileFolder}`);
+  if (!silent) console.log(`🔐 Baileys auth: local folder ${fileFolder}`);
   return { ...fileState, backend: 'files', clearAuth: null, tenantId };
 }

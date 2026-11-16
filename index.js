@@ -6,10 +6,10 @@ import { loadAiConfig } from './aiConfigStore.js';
 import { initDatabase, ensurePlatformTenant } from './db.js';
 import { indexVilasaKnowledge } from './vilasaDemo.js';
 import {
-  startTenantSession,
   stopTenantSession,
   sendTenantDemo,
   getSock,
+  restoreAuthenticatedSessions,
 } from './sessionManager.js';
 import { redactSecrets } from './whatsappSend.js';
 import { startBillingScheduler } from './billingScheduler.js';
@@ -84,9 +84,10 @@ startBillingScheduler();
 
 if (platform?.id) {
   platformTenantId = platform.id;
-  startTenantSession(platform.id, { syncGlobalQr: true }).catch((err) =>
-    console.error('Platform WhatsApp session failed:', err?.message || err)
-  );
 } else {
   console.warn('⚠️ No platform tenant — start a client session from /dashboard');
 }
+
+restoreAuthenticatedSessions().catch((err) =>
+  console.warn('Session restore skipped:', err?.message || err)
+);

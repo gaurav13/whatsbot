@@ -497,6 +497,20 @@ export async function loadUserSession(jid) {
   return result.rows[0] || null;
 }
 
+export async function listTenantIdsWithBaileysCreds() {
+  const pool = await getPool();
+  if (!pool) return [];
+  const result = await pool.query(`
+    SELECT DISTINCT a.tenant_id::text AS tenant_id
+    FROM baileys_auth a
+    JOIN tenants t ON t.id = a.tenant_id
+    WHERE a.id = 'creds'
+      AND a.tenant_id IS NOT NULL
+      AND COALESCE(t.is_active, TRUE) = TRUE
+  `);
+  return result.rows.map((row) => row.tenant_id).filter(Boolean);
+}
+
 export async function baileysAuthRead(id, tenantId = null) {
   const pool = await getPool();
   if (!pool) return null;
@@ -1012,6 +1026,33 @@ export async function adminUpdateTenant(id, patch = {}) {
     ]
   );
   return publicTenant(result.rows[0]);
+}
+
+export async function deleteTenant(id) {
+  const current = await getTenantById(id);
+  if (!current) throw new Error('Tenant not found');
+  if (current.is_platform) {
+    throw new Error('The platform tenant cannot be deleted.');
+  }
+
+  const pool = await getPool();
+  if (!pool) throw new Error('Database is not configured');
+
+  for (const sql of [
+    `DELETE FROM tenant_leads WHERE tenant_id = $1`,
+    `DELETE FROM message_logs WHERE tenant_id = $1`,
+    `DELETE FROM token_usage WHERE tenant_id = $1`,
+    `DELETE FROM baileys_auth WHERE tenant_id = $1`,
+  ]) {
+    try {
+      await pool.query(sql, [id]);
+    } catch (err) {
+      console.warn('deleteTenant related cleanup skipped:', err?.message || err);
+    }
+  }
+  await pool.query(`DELETE FROM tenants WHERE id = $1`, [id]);
+
+  return { ok: true, id, business_name: current.business_name };
 }
 
 export async function expireOverduePlans() {

@@ -196,6 +196,9 @@ export function superAdminDashboardHtml() {
             '<button class="secondary" type="button" data-act="reset">Reset used</button>' +
             '<button class="secondary" type="button" data-act="toggle">' + (t.is_active && !expired ? 'Disable' : 'Enable') + '</button>' +
             '<button class="danger" type="button" data-act="disconnect">Disconnect WA</button>' +
+            (t.is_platform
+              ? ''
+              : '<button class="danger" type="button" data-act="delete">Delete tenant</button>') +
           '</div></article>';
       }).join('');
 
@@ -252,10 +255,17 @@ export function superAdminDashboardHtml() {
           });
         } else if (act === 'disconnect') {
           res = await fetch('/api/admin/tenants/' + id + '/disconnect', { method: 'POST' });
+        } else if (act === 'delete') {
+          const name = (card.querySelector('.biz')?.textContent || 'this tenant').trim();
+          if (!confirm('Delete ' + name + '? This cannot be undone. WhatsApp session, leads, and usage for this tenant will be removed.')) {
+            msg.textContent = '';
+            return;
+          }
+          res = await fetch('/api/admin/tenants/' + id, { method: 'DELETE' });
         }
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Request failed');
-        msg.textContent = 'Updated';
+        msg.textContent = act === 'delete' ? 'Tenant deleted' : 'Updated';
         await loadTenants();
       } catch (err) {
         msg.textContent = err.message;

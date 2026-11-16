@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import express from 'express';
 import session from 'express-session';
 import multer from 'multer';
@@ -30,11 +32,13 @@ import {
   listTenantsAdmin,
   isTenantPlanActive,
   adminUpdateTenant,
+  deleteTenant,
   phoneFromJid,
 } from './db.js';
 import {
   startTenantSession,
   stopTenantSession,
+  destroyTenantRuntime,
   getTenantQrState,
   listWhatsAppInstances,
 } from './sessionManager.js';
@@ -487,7 +491,7 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
 
   app.post('/api/tenant/whatsapp/start', requireTenant, async (req, res) => {
     try {
-      await startTenantSession(req.session.tenantId);
+      await startTenantSession(req.session.tenantId, { allowQr: true, silent: false });
       res.json({ ok: true, ...getTenantQrState(req.session.tenantId) });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message || String(err) });
@@ -624,7 +628,7 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
       if (req.body?.is_active === false) {
         await stopTenantSession(req.params.id, { logout: false, restart: false });
       } else if (req.body?.is_active === true || Number(req.body?.renew_days) > 0) {
-        startTenantSession(req.params.id).catch(() => {});
+        startTenantSession(req.params.id, { allowQr: false, silent: true }).catch(() => {});
       }
       res.json({ ok: true, tenant });
     } catch (err) {
@@ -641,6 +645,23 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
       res.json({ ok: true, ...result });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.delete('/api/admin/tenants/:id', async (req, res) => {
+    try {
+      await destroyTenantRuntime(req.params.id);
+      const result = await deleteTenant(req.params.id);
+      try {
+        const dir = path.join(KNOWLEDGE_DIR, 'tenants', String(req.params.id));
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // ignore missing knowledge folder
+      }
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      console.error('DELETE /api/admin/tenants failed:', err);
+      res.status(400).json({ ok: false, error: err.message || String(err) });
     }
   });
 
