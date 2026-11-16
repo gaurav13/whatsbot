@@ -34,6 +34,7 @@ import {
   adminUpdateTenant,
   deleteTenant,
   phoneFromJid,
+  ensurePlatformTenant,
 } from './db.js';
 import {
   startTenantSession,
@@ -41,6 +42,8 @@ import {
   destroyTenantRuntime,
   getTenantQrState,
   listWhatsAppInstances,
+  ensureTenantSessionForUi,
+  publicQrPayload,
 } from './sessionManager.js';
 import { superAdminDashboardHtml } from './superAdminPage.js';
 import {
@@ -205,28 +208,33 @@ function qrPageHtml() {
         const statusEl = document.getElementById('status');
         const qrEl = document.getElementById('qr');
         const hintEl = document.getElementById('hint');
-        const connected = data.connectionStatus === 'connected';
+        const connected = Boolean(data.connected) || data.connectionStatus === 'connected';
+        const scanning = Boolean(data.scanning) || Boolean(data.qrDataUrl);
         const isLoggingOut = data.connectionStatus === 'logging_out';
+        const connecting = ['connecting', 'starting', 'reconnecting'].includes(data.connectionStatus);
 
-        statusEl.textContent = data.connectionStatus || 'unknown';
+        statusEl.textContent = data.displayStatus || (connected ? 'Connected' : scanning ? 'Scanning QR' : (data.connectionStatus || 'unknown'));
         statusEl.classList.toggle('ok', connected);
 
-        disconnectBtn.hidden = !(connected || isLoggingOut);
+        disconnectBtn.hidden = !(connected || isLoggingOut || scanning);
         disconnectBtn.disabled = disconnecting || isLoggingOut;
         disconnectBtn.textContent = (disconnecting || isLoggingOut) ? 'Disconnecting…' : 'Disconnect WhatsApp';
 
-        if (data.qrDataUrl) {
+        if (connected) {
+          qrEl.innerHTML = '<p style="color:#128c7e;font-weight:600;margin:0">Connected ✅<br/>Session is live — no QR needed.</p>';
+          hintEl.textContent = 'Bot is online. Use Disconnect WhatsApp to expire this session and show a new QR.';
+        } else if (data.qrDataUrl) {
           qrEl.innerHTML = '<img alt="WhatsApp QR Code" src="' + data.qrDataUrl + '" />';
-          hintEl.textContent = 'QR ready — scan now before it expires.';
-        } else if (connected) {
-          qrEl.innerHTML = '<p style="color:#128c7e;font-weight:600;margin:0">Connected ✅<br/>No QR needed.</p>';
-          hintEl.textContent = 'Bot is online. Use Disconnect WhatsApp for a new QR, or Logout to leave the dashboard.';
+          hintEl.textContent = 'Scanning QR — scan now in WhatsApp → Linked Devices before it expires.';
         } else if (isLoggingOut) {
           qrEl.innerHTML = '<p style="color:#b45309;font-weight:600;margin:0">Disconnecting WhatsApp…</p>';
-          hintEl.textContent = 'Clearing session and requesting a fresh QR.';
+          hintEl.textContent = 'Clearing the old session and requesting a fresh QR.';
+        } else if (connecting) {
+          qrEl.innerHTML = '<p style="color:#93a4b5;font-weight:600;margin:0">Connecting existing session…</p>';
+          hintEl.textContent = 'Reusing a saved WhatsApp link. A QR will appear only if WhatsApp asks to re-link.';
         } else {
-          qrEl.textContent = 'Waiting for QR from Baileys…';
-          hintEl.textContent = 'Keep the bot running. This page auto-refreshes.';
+          qrEl.innerHTML = '<p style="color:#93a4b5;margin:0">Requesting a fresh QR…</p>';
+          hintEl.textContent = 'Previous session is disconnected or expired. This page auto-refreshes.';
         }
       } catch (err) {
         document.getElementById('status').textContent = 'web server unreachable';
@@ -302,6 +310,7 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
       cookie: {
         httpOnly: true,
         sameSite: 'lax',
+        path: '/',
         // Use Secure cookies when served over HTTPS (Nginx TLS)
         secure: process.env.COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production',
         maxAge: 1000 * 60 * 60 * 12, // 12 hours
@@ -322,7 +331,33 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     if (req.session?.authenticated) return next();
     if (req.session?.tenantId && req.path === '/') return res.redirect('/dashboard');
     if (wantsJson(req)) return res.status(401).json({ error: 'Unauthorized. Please login.' });
+    if (req.path === '/') return res.redirect('/login');
     return res.redirect('/operator');
+  }
+
+  const sessionCookieOpts = {
+    path: '/',
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production',
+  };
+
+  function endWebSession(req, res, { redirectTo = '/login', json = false } = {}) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    const finish = () => {
+      res.clearCookie('gsai.sid', sessionCookieOpts);
+      if (json) return res.json({ ok: true, redirect: '/login' });
+      return res.redirect(302, redirectTo);
+    };
+    if (!req.session) return finish();
+    req.session.tenantId = null;
+    req.session.tenantEmail = null;
+    req.session.authenticated = false;
+    req.session.destroy((err) => {
+      if (err) console.warn('session destroy:', err?.message || err);
+      finish();
+    });
   }
 
   function requireTenant(req, res, next) {
@@ -393,6 +428,7 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
   });
 
   app.get('/login', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     if (req.session?.tenantId) return res.redirect('/dashboard');
     if (req.session?.authenticated) return res.redirect('/');
     res.type('html').send(tenantLoginPage());
@@ -486,13 +522,23 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
   );
 
   app.get('/api/tenant/qr.json', requireTenant, (req, res) => {
-    res.json(getTenantQrState(req.session.tenantId));
+    res.json(ensureTenantSessionForUi(req.session.tenantId, { syncGlobalQr: false }));
   });
 
   app.post('/api/tenant/whatsapp/start', requireTenant, async (req, res) => {
     try {
-      await startTenantSession(req.session.tenantId, { allowQr: true, silent: false });
-      res.json({ ok: true, ...getTenantQrState(req.session.tenantId) });
+      const id = req.session.tenantId;
+      const current = getTenantQrState(id);
+      if (current.connected && !req.body?.relink) {
+        return res.json({ ok: true, ...current });
+      }
+      res.json({
+        ok: true,
+        ...ensureTenantSessionForUi(id, {
+          syncGlobalQr: false,
+          forceQr: Boolean(req.body?.relink),
+        }),
+      });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message || String(err) });
     }
@@ -537,35 +583,51 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
 
   // Session logout (destroys web login session)
   app.get('/logout', (req, res) => {
-    req.session.destroy(() => {
-      res.clearCookie('gsai.sid');
-      res.redirect('/login');
-    });
+    endWebSession(req, res, { redirectTo: '/login' });
+  });
+  app.post('/logout', (req, res) => {
+    endWebSession(req, res, { redirectTo: '/login' });
   });
   app.post('/auth/logout', (req, res) => {
-    req.session.destroy(() => {
-      res.clearCookie('gsai.sid');
-      res.json({ ok: true });
-    });
+    endWebSession(req, res, { json: true });
   });
 
-  // Everything below requires login
-  app.use(requireOperator);
-
-  // Dashboard / QR UI (protected — redirects to /login if not authenticated)
-  app.get('/', (_req, res) => {
+  app.get('/', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    if (req.session?.tenantId) return res.redirect('/dashboard');
+    if (!req.session?.authenticated) return res.redirect('/login');
     res.type('html').send(qrPageHtml());
   });
 
-  app.get('/qr.json', (_req, res) => {
-    res.json(getQrState());
+  // Everything below requires operator login
+  app.use(requireOperator);
+
+  app.get('/qr.json', async (_req, res) => {
+    try {
+      const platform = await ensurePlatformTenant();
+      if (platform?.id) {
+        return res.json(
+          ensureTenantSessionForUi(platform.id, { syncGlobalQr: true })
+        );
+      }
+      res.json(publicQrPayload(getQrState()));
+    } catch (err) {
+      res.status(500).json({ error: err.message || String(err) });
+    }
   });
 
-  app.get('/qr.png', (_req, res) => {
-    const { qrDataUrl } = getQrState();
-    if (!qrDataUrl) return res.status(404).send('QR not available yet');
-    const base64 = qrDataUrl.replace(/^data:image\/png;base64,/, '');
-    res.type('png').send(Buffer.from(base64, 'base64'));
+  app.get('/qr.png', async (_req, res) => {
+    try {
+      const platform = await ensurePlatformTenant();
+      const state = platform?.id
+        ? ensureTenantSessionForUi(platform.id, { syncGlobalQr: true })
+        : publicQrPayload(getQrState());
+      if (!state.qrDataUrl) return res.status(404).send('QR not available yet');
+      const base64 = state.qrDataUrl.replace(/^data:image\/png;base64,/, '');
+      res.type('png').send(Buffer.from(base64, 'base64'));
+    } catch (err) {
+      res.status(500).send(err.message || String(err));
+    }
   });
 
   async function handleWhatsAppDisconnect(_req, res) {
@@ -890,9 +952,9 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     console.log(`📷 WhatsApp QR page: http://127.0.0.1:${port}/`);
     console.log(`🔐 Login page: http://127.0.0.1:${port}/login`);
     console.log(`❤️  Health: http://127.0.0.1:${port}/health`);
-    console.log(`🧪 Website Demo: http://127.0.0.1:${port}/demo`);
     console.log(`📚 Knowledge upload: http://127.0.0.1:${port}/knowledge`);
     console.log(`⚙️  AI Settings: http://127.0.0.1:${port}/admin`);
+    console.log(`🧪 Website Demo: http://127.0.0.1:${port}/demo`);
     console.log(`📂 Knowledge folder: ${KNOWLEDGE_DIR}`);
   });
 

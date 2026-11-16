@@ -224,10 +224,18 @@ export function tenantDashboardPage() {
         const res = await fetch('/api/tenant/qr.json');
         if (res.status === 401) return;
         const data = await res.json();
-        document.getElementById('waStatus').textContent = 'Status: ' + (data.connectionStatus || 'unknown');
+        const connected = Boolean(data.connected) || data.connectionStatus === 'connected';
+        const scanning = Boolean(data.scanning) || Boolean(data.qrDataUrl);
+        const label = data.displayStatus || (connected ? 'Connected' : scanning ? 'Scanning QR' : (data.connectionStatus || 'unknown'));
+        const statusEl = document.getElementById('waStatus');
+        statusEl.textContent = 'Status: ' + label;
+        statusEl.className = 'meta' + (connected ? ' ok' : '');
         const box = document.getElementById('qrBox');
-        if (data.qrDataUrl) box.innerHTML = '<img alt="WhatsApp QR" src="' + data.qrDataUrl + '" />';
-        else if (data.connectionStatus === 'connected') box.textContent = 'Connected';
+        if (connected) box.textContent = 'Connected';
+        else if (data.qrDataUrl) box.innerHTML = '<img alt="WhatsApp QR" src="' + data.qrDataUrl + '" />';
+        else if (['connecting', 'starting', 'reconnecting'].includes(data.connectionStatus))
+          box.textContent = 'Connecting existing session…';
+        else box.textContent = 'Requesting a fresh QR…';
       }
 
       document.getElementById('saveBtn').onclick = async () => {

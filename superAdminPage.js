@@ -105,7 +105,7 @@ export function superAdminDashboardHtml() {
       <a href="/admin/dashboard">Tenants</a>
       <a href="/admin/ai">AI Settings</a>
       <a href="/knowledge">Knowledge</a>
-      <a href="/demo">Demo</a>
+      <a href="/demo">Website Demo</a>
       <a href="/logout">Logout</a>
     </div>
     <h1>Super Admin — Tenants</h1>

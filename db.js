@@ -501,12 +501,16 @@ export async function listTenantIdsWithBaileysCreds() {
   const pool = await getPool();
   if (!pool) return [];
   const result = await pool.query(`
-    SELECT DISTINCT a.tenant_id::text AS tenant_id
-    FROM baileys_auth a
-    JOIN tenants t ON t.id = a.tenant_id
-    WHERE a.id = 'creds'
-      AND a.tenant_id IS NOT NULL
-      AND COALESCE(t.is_active, TRUE) = TRUE
+    SELECT t.id::text AS tenant_id
+    FROM tenants t
+    WHERE COALESCE(t.is_active, TRUE) = TRUE
+      AND (
+        NULLIF(t.linked_whatsapp, '') IS NOT NULL
+        OR EXISTS (
+          SELECT 1 FROM baileys_auth a
+          WHERE a.tenant_id = t.id AND a.id = 'creds'
+        )
+      )
   `);
   return result.rows.map((row) => row.tenant_id).filter(Boolean);
 }

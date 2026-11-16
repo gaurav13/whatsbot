@@ -12,6 +12,7 @@ import {
   setTenantLinkedWhatsapp,
   isTenantPlanActive,
   listTenantIdsWithBaileysCreds,
+  ensurePlatformTenant,
 } from './db.js';
 import { attachWhatsAppHandler, pushTenantWelcome } from './whatsappHandler.js';
 import { setQr, clearQr, setConnectionStatus } from './qrState.js';
@@ -74,19 +75,94 @@ export function listWhatsAppInstances() {
 export function getTenantQrState(tenantId) {
   const inst = instances.get(String(tenantId));
   if (!inst) {
-    return {
+    return publicQrPayload({
       connectionStatus: 'stopped',
       hasQr: false,
       qrDataUrl: null,
       lastUpdated: null,
-    };
+    });
   }
-  return {
+  return publicQrPayload({
     connectionStatus: inst.connectionStatus,
     hasQr: Boolean(inst.qrDataUrl),
     qrDataUrl: inst.qrDataUrl,
     lastUpdated: inst.lastUpdated,
+    linkedJid: inst.linkedJid || inst.sock?.user?.id || null,
+  });
+}
+
+export function publicQrPayload(state = {}) {
+  const connectionStatus = state.connectionStatus || 'stopped';
+  const hasQr = Boolean(state.qrDataUrl);
+  const connected = connectionStatus === 'connected';
+  const scanning =
+    hasQr || connectionStatus === 'waiting_for_scan' || connectionStatus === 'needs_scan';
+  const connecting = ['connecting', 'starting', 'reconnecting'].includes(connectionStatus);
+  let displayStatus = connectionStatus;
+  if (connected) displayStatus = 'Connected';
+  else if (scanning) displayStatus = 'Scanning QR';
+  else if (connectionStatus === 'logging_out') displayStatus = 'Disconnecting…';
+  else if (connecting) displayStatus = 'Connecting…';
+  else if (['logged_out', 'stopped'].includes(connectionStatus)) displayStatus = 'Disconnected';
+  else if (connectionStatus === 'disabled') displayStatus = 'Disabled';
+  return {
+    ...state,
+    connectionStatus,
+    hasQr,
+    connected,
+    scanning,
+    displayStatus,
   };
+}
+
+/**
+ * Open a dashboard/QR page: keep a live session, or start one that is allowed
+ * to emit a QR when creds are missing, expired, or the user asked to relink.
+ */
+export function ensureTenantSessionForUi(tenantId, { syncGlobalQr = false, forceQr = false } = {}) {
+  const id = String(tenantId || '');
+  if (!id) return publicQrPayload({ connectionStatus: 'stopped' });
+
+  let inst = instances.get(id);
+  if (!inst) {
+    inst = blankInstance(id);
+    instances.set(id, inst);
+  }
+  inst.allowQr = true;
+  inst.silent = false;
+  if (syncGlobalQr) inst.syncGlobalQr = true;
+
+  if (forceQr) {
+    stopTenantSession(id, {
+      logout: true,
+      restart: true,
+      syncGlobalQr: Boolean(inst.syncGlobalQr),
+    }).catch((err) => console.warn('QR relink failed:', redactSecrets(err)));
+    return getTenantQrState(id);
+  }
+
+  if (inst.connectionStatus === 'connected' && inst.sock) {
+    inst.qrDataUrl = null;
+    if (inst.syncGlobalQr) clearQr('connected');
+    return getTenantQrState(id);
+  }
+
+  if (inst.qrDataUrl) {
+    if (inst.syncGlobalQr) setQr('ui', inst.qrDataUrl);
+    return getTenantQrState(id);
+  }
+
+  const shouldStart = !inst.bootPromise && !inst.reconnectTimer && !inst.sock;
+
+  if (shouldStart) {
+    startTenantSession(id, {
+      allowQr: true,
+      silent: false,
+      syncGlobalQr: Boolean(inst.syncGlobalQr),
+    }).catch((err) => console.warn('QR session start failed:', redactSecrets(err)));
+  }
+
+  return getTenantQrState(id);
 }
 
 export function getSock(tenantId) {
@@ -129,7 +205,11 @@ export async function startTenantSession(
     }
     const folder = authFolder(id);
     fs.mkdirSync(folder, { recursive: true });
-    const auth = await loadBaileysAuthState(folder, id, { silent: inst.silent });
+    const legacyRoot = path.join(__dirname, 'baileys_auth_info');
+    const auth = await loadBaileysAuthState(folder, id, {
+      silent: inst.silent,
+      fallbackFolder: tenant?.is_platform ? legacyRoot : null,
+    });
 
     const sock = makeWASocket({
       auth: auth.state,
@@ -156,6 +236,9 @@ export async function startTenantSession(
           inst.qrDataUrl = null;
           inst.connectionStatus = 'needs_scan';
           inst.lastUpdated = new Date().toISOString();
+          console.log(
+            `♻️ Tenant ${id} is not linked anymore — open /dashboard and click Start to scan a new QR`
+          );
           try {
             sock.end?.(undefined);
           } catch {
@@ -203,23 +286,25 @@ export async function startTenantSession(
           return;
         }
         const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const errMsg = String(lastDisconnect?.error?.message || '');
         const loggedOut = statusCode === DisconnectReason.loggedOut;
         const replaced = statusCode === DisconnectReason.connectionReplaced;
+        const corruptAuth = /Incorrect private key length|bad-session|not-authorized/i.test(
+          errMsg
+        );
         inst.connectionStatus = loggedOut ? 'logged_out' : 'reconnecting';
         inst.qrDataUrl = null;
         inst.lastUpdated = new Date().toISOString();
         if (inst.syncGlobalQr) clearQr(inst.connectionStatus);
         if (inst.sock === sock) inst.sock = null;
-        if (!inst.silent) {
-          console.warn(
-            `🔌 Tenant ${id} disconnected (${disconnectLabel(statusCode)})` +
-              (lastDisconnect?.error?.message
-                ? ` — ${redactSecrets(lastDisconnect.error.message)}`
-                : '')
-          );
-        }
+        console.warn(
+          `🔌 Tenant ${id} disconnected (${disconnectLabel(statusCode)})` +
+            (lastDisconnect?.error?.message
+              ? ` — ${redactSecrets(lastDisconnect.error.message)}`
+              : '')
+        );
 
-        if (loggedOut) {
+        if (loggedOut || corruptAuth) {
           try {
             await baileysAuthClearAll(id);
             fs.rmSync(authFolder(id), { recursive: true, force: true });
@@ -227,6 +312,21 @@ export async function startTenantSession(
             // ignore
           }
           inst.connectionStatus = 'logged_out';
+          inst.allowQr = true;
+          inst.silent = false;
+          if (!loggedOut && corruptAuth) {
+            console.warn(`🔐 Tenant ${id} auth was corrupt — requesting a fresh QR`);
+            inst.reconnectTimer = setTimeout(() => {
+              inst.reconnectTimer = null;
+              startTenantSession(id, {
+                syncGlobalQr: inst.syncGlobalQr,
+                allowQr: true,
+                silent: false,
+              }).catch((err) =>
+                console.error(`QR restart failed for tenant ${id}:`, redactSecrets(err))
+              );
+            }, 800);
+          }
           return;
         }
 
@@ -354,7 +454,11 @@ export async function stopTenantSession(
   inst.loggingOut = false;
   if (restart) {
     await sleep(400);
-    await startTenantSession(id, { allowQr: true });
+    await startTenantSession(id, {
+      allowQr: true,
+      silent: false,
+      syncGlobalQr: Boolean(syncGlobalQr),
+    });
   }
   return { ok: true, message: logout ? 'Logged out. Scan a new QR to reconnect.' : 'Stopped' };
 }
@@ -374,15 +478,23 @@ export async function restoreAuthenticatedSessions() {
     // ignore
   }
 
-  const ids = [...new Set([...fromDb, ...fromDisk])];
+  const platform = await ensurePlatformTenant().catch(() => null);
+  const ids = [...new Set([...fromDb, ...fromDisk, platform?.id].filter(Boolean))];
   const restore = [];
   for (const id of ids) {
-    const ok = await tenantHasRegisteredAuth(id, authFolder(id));
-    if (ok) restore.push(id);
+    const tenant = await getTenantById(id).catch(() => null);
+    const ok =
+      (await tenantHasRegisteredAuth(id, authFolder(id))) ||
+      (tenant?.is_platform &&
+        (await tenantHasRegisteredAuth(id, path.join(__dirname, 'baileys_auth_info'))));
+    if (ok || tenant?.linked_whatsapp) restore.push(id);
+    else console.log(`♻️ Skip restore ${id} (no registered WhatsApp creds yet)`);
   }
 
   if (!restore.length) {
-    console.log('♻️ No saved WhatsApp sessions to restore — tenants can scan QR from /dashboard');
+    console.log(
+      '♻️ No linked WhatsApp sessions found. Click Start / refresh QR on /dashboard to connect a number.'
+    );
     return { restored: 0 };
   }
 
