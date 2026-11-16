@@ -186,7 +186,7 @@ export function tenantDashboardPage() {
         <div class="qr" id="qrBox">QR appears here after you start a session</div>
         <div class="row">
           <button id="startBtn" type="button">Start / refresh QR</button>
-          <button id="logoutWaBtn" class="secondary" type="button">Unlink WhatsApp</button>
+          <button id="logoutWaBtn" class="secondary" type="button">Reset session &amp; new QR</button>
         </div>
       </div>
 

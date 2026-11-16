@@ -1,7 +1,6 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import makeWASocket, { DisconnectReason } from '@whiskeysockets/baileys';
 import pino from 'pino';
@@ -18,6 +17,9 @@ import {
   tryAcquireWhatsAppLock,
   heartbeatWhatsAppLock,
   releaseWhatsAppLock,
+  clearStaleWhatsAppLocks,
+  claimHostRuntime,
+  heartbeatHostRuntime,
 } from './db.js';
 import { attachWhatsAppHandler, pushTenantWelcome } from './whatsappHandler.js';
 import { setQr, clearQr, setConnectionStatus } from './qrState.js';
@@ -26,9 +28,15 @@ import { redactSecrets } from './whatsappSend.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const baileysLogger = pino({ level: 'silent' });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export const WA_HOSTNAME = os.hostname();
+/** Stable across PM2 restarts of the same app (no random suffix, no pid). */
 export const WA_INSTANCE_ID =
   process.env.WA_INSTANCE_ID ||
-  `${os.hostname()}:${process.pid}:${crypto.randomBytes(3).toString('hex')}`;
+  `${WA_HOSTNAME}:pm2-${process.env.pm_id || process.env.NODE_APP_INSTANCE || '0'}`;
+
+let hostHeartbeatTimer = null;
+let ownsHostRuntime = false;
 
 function stopHeartbeat(inst) {
   if (inst?.heartbeatTimer) {
@@ -37,7 +45,7 @@ function stopHeartbeat(inst) {
   }
 }
 
-/** @type {Map<string, { sock: any, tenantId: string, qrDataUrl: string|null, connectionStatus: string, reconnectTimer: any, bootPromise: any, lastUpdated: string, loggingOut: boolean }>} */
+/** @type {Map<string, object>} */
 const instances = new Map();
 
 function authFolder(tenantId) {
@@ -55,6 +63,7 @@ function blankInstance(tenantId) {
     lastUpdated: new Date().toISOString(),
     loggingOut: false,
     reconnectAttempt: 0,
+    generation: 0,
   };
 }
 
@@ -75,6 +84,28 @@ function disconnectLabel(statusCode) {
     [DisconnectReason.multideviceMismatch]: 'multidevice mismatch',
   };
   return map[statusCode] || `code ${statusCode ?? 'n/a'}`;
+}
+
+async function disposeSocket(sock) {
+  if (!sock) return;
+  try {
+    sock.ev?.removeAllListeners?.();
+  } catch {
+    // ignore
+  }
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 1200);
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    try {
+      sock.ws?.once?.('close', done);
+      sock.end?.(undefined);
+    } catch {
+      done();
+    }
+  });
 }
 
 export function listWhatsAppInstances() {
@@ -120,7 +151,8 @@ export function publicQrPayload(state = {}) {
   else if (connecting) displayStatus = 'Connecting…';
   else if (['logged_out', 'stopped'].includes(connectionStatus)) displayStatus = 'Disconnected';
   else if (connectionStatus === 'disabled') displayStatus = 'Disabled';
-  else if (connectionStatus === 'conflict') displayStatus = 'Taken over by another bot instance';
+  else if (connectionStatus === 'conflict')
+    displayStatus = 'Session conflict — Reset & re-link this number';
   return {
     ...state,
     connectionStatus,
@@ -131,10 +163,6 @@ export function publicQrPayload(state = {}) {
   };
 }
 
-/**
- * Open a dashboard/QR page: keep a live session, or start one that is allowed
- * to emit a QR when creds are missing, expired, or the user asked to relink.
- */
 export function ensureTenantSessionForUi(
   tenantId,
   { syncGlobalQr = false, forceQr = false, stealLock = false } = {}
@@ -151,16 +179,14 @@ export function ensureTenantSessionForUi(
   inst.silent = false;
   if (syncGlobalQr) inst.syncGlobalQr = true;
 
-  if (inst.connectionStatus === 'conflict' && !forceQr && !stealLock) {
+  if (forceQr) {
+    resetTenantWhatsAppSession(id, { syncGlobalQr: Boolean(inst.syncGlobalQr) }).catch((err) =>
+      console.warn('QR relink failed:', redactSecrets(err))
+    );
     return getTenantQrState(id);
   }
 
-  if (forceQr) {
-    stopTenantSession(id, {
-      logout: true,
-      restart: true,
-      syncGlobalQr: Boolean(inst.syncGlobalQr),
-    }).catch((err) => console.warn('QR relink failed:', redactSecrets(err)));
+  if (inst.connectionStatus === 'conflict' && !stealLock) {
     return getTenantQrState(id);
   }
 
@@ -175,14 +201,16 @@ export function ensureTenantSessionForUi(
     return getTenantQrState(id);
   }
 
-  const shouldStart = !inst.bootPromise && !inst.reconnectTimer && !inst.sock;
+  if (inst.bootPromise) return getTenantQrState(id);
+
+  const shouldStart = !inst.reconnectTimer && !inst.sock;
 
   if (shouldStart) {
     startTenantSession(id, {
       allowQr: true,
       silent: false,
       syncGlobalQr: Boolean(inst.syncGlobalQr),
-      stealLock: Boolean(stealLock || forceQr),
+      stealLock: Boolean(stealLock),
     }).catch((err) => console.warn('QR session start failed:', redactSecrets(err)));
   }
 
@@ -209,236 +237,271 @@ export async function startTenantSession(
   if (inst.bootPromise) return inst.bootPromise;
 
   inst.bootPromise = (async () => {
+    const generation = (inst.generation || 0) + 1;
+    inst.generation = generation;
+    let settle;
+    const settled = new Promise((resolve) => {
+      settle = () => resolve(inst);
+    });
+
     try {
-    if (inst.sock) {
-      try {
-        inst.sock.ev?.removeAllListeners?.();
-        inst.sock.end?.(undefined);
-      } catch {
-        // ignore
+      if (inst.reconnectTimer) {
+        clearTimeout(inst.reconnectTimer);
+        inst.reconnectTimer = null;
       }
+      stopHeartbeat(inst);
+      const previous = inst.sock;
       inst.sock = null;
-      await sleep(400);
-    }
+      await disposeSocket(previous);
 
-    const tenant = await getTenantById(id);
-    if (tenant && !isTenantPlanActive(tenant)) {
-      inst.connectionStatus = 'disabled';
-      inst.sock = null;
-      return inst;
-    }
-    const gotLock = await tryAcquireWhatsAppLock(id, WA_INSTANCE_ID, { steal: stealLock });
-    if (!gotLock) {
-      inst.connectionStatus = 'conflict';
-      inst.sock = null;
-      console.warn(
-        `⏸️ Tenant ${id} WhatsApp is already running on another instance — not connecting here`
-      );
-      return inst;
-    }
-    const folder = authFolder(id);
-    fs.mkdirSync(folder, { recursive: true });
-    const legacyRoot = path.join(__dirname, 'baileys_auth_info');
-    const auth = await loadBaileysAuthState(folder, id, {
-      silent: inst.silent,
-      fallbackFolder: tenant?.is_platform ? legacyRoot : null,
-    });
-
-    const sock = makeWASocket({
-      auth: auth.state,
-      logger: baileysLogger,
-      printQRInTerminal: false,
-      markOnlineOnConnect: false,
-      syncFullHistory: false,
-      connectTimeoutMs: 30_000,
-      retryRequestDelayMs: 500,
-    });
-    inst.sock = sock;
-    inst.connectionStatus = 'connecting';
-    inst.lastUpdated = new Date().toISOString();
-    if (inst.syncGlobalQr) setConnectionStatus('connecting');
-
-    sock.ev.on('creds.update', auth.saveCreds);
-
-    sock.ev.on('connection.update', async (update) => {
-      try {
-      const { connection, lastDisconnect, qr } = update;
-      if (qr) {
-        if (!inst.allowQr) {
-          inst.skipReconnect = true;
-          inst.qrDataUrl = null;
-          inst.connectionStatus = 'needs_scan';
-          inst.lastUpdated = new Date().toISOString();
-          console.log(
-            `♻️ Tenant ${id} is not linked anymore — open /dashboard and click Start to scan a new QR`
-          );
-          try {
-            sock.end?.(undefined);
-          } catch {
-            // ignore
-          }
-          if (inst.sock === sock) inst.sock = null;
-          return;
-        }
-        if (!inst.silent) {
-          console.log(`📷 Tenant ${id} — scan WhatsApp QR at /dashboard`);
-        }
-        if (inst.syncGlobalQr && !inst.silent) {
-          qrcodeTerminal.generate(qr, { small: true });
-        }
-        try {
-          inst.qrDataUrl = await QRCode.toDataURL(qr, {
-            errorCorrectionLevel: 'M',
-            margin: 2,
-            width: 320,
-          });
-          inst.connectionStatus = 'waiting_for_scan';
-          inst.lastUpdated = new Date().toISOString();
-          if (inst.syncGlobalQr) setQr(qr, inst.qrDataUrl);
-        } catch (err) {
-          console.error('QR render failed:', err?.message || err);
-        }
+      const tenant = await getTenantById(id);
+      if (tenant && !isTenantPlanActive(tenant)) {
+        inst.connectionStatus = 'disabled';
+        settle();
+        return inst;
       }
-
-      if (connection === 'connecting') {
-        inst.connectionStatus = 'connecting';
-        if (inst.syncGlobalQr) setConnectionStatus('connecting');
-      }
-
-      if (connection === 'close') {
-        if (inst.loggingOut) {
-          inst.connectionStatus = 'logging_out';
-          inst.qrDataUrl = null;
-          return;
-        }
-        if (inst.skipReconnect) {
-          inst.skipReconnect = false;
-          inst.connectionStatus = 'needs_scan';
-          inst.qrDataUrl = null;
-          if (inst.sock === sock) inst.sock = null;
-          return;
-        }
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const errMsg = String(lastDisconnect?.error?.message || '');
-        const loggedOut = statusCode === DisconnectReason.loggedOut;
-        const replaced =
-          statusCode === DisconnectReason.connectionReplaced ||
-          /conflict|replaced/i.test(errMsg);
-        const badSession = statusCode === DisconnectReason.badSession;
-        const corruptAuth = /Incorrect private key length|bad-session|not-authorized/i.test(
-          errMsg
-        );
-        inst.connectionStatus = loggedOut ? 'logged_out' : 'reconnecting';
-        inst.qrDataUrl = null;
-        inst.lastUpdated = new Date().toISOString();
-        if (inst.syncGlobalQr) clearQr(inst.connectionStatus);
-        if (inst.sock === sock) inst.sock = null;
+      const gotLock = await tryAcquireWhatsAppLock(id, WA_INSTANCE_ID, {
+        steal: stealLock || ownsHostRuntime,
+      });
+      if (!gotLock) {
+        inst.connectionStatus = 'conflict';
         console.warn(
-          `🔌 Tenant ${id} disconnected (${disconnectLabel(statusCode)})` +
-            (lastDisconnect?.error?.message
-              ? ` — ${redactSecrets(lastDisconnect.error.message)}`
-              : '')
+          `⏸️ Tenant ${id} WhatsApp lock is held by another live process — not connecting here`
         );
+        settle();
+        return inst;
+      }
+      const folder = authFolder(id);
+      fs.mkdirSync(folder, { recursive: true });
+      const legacyRoot = path.join(__dirname, 'baileys_auth_info');
+      const auth = await loadBaileysAuthState(folder, id, {
+        silent: inst.silent,
+        fallbackFolder: tenant?.is_platform ? legacyRoot : null,
+      });
 
-        if (loggedOut || corruptAuth) {
-          try {
-            await baileysAuthClearAll(id);
-            fs.rmSync(authFolder(id), { recursive: true, force: true });
-          } catch {
-            // ignore
-          }
-          inst.connectionStatus = 'logged_out';
-          inst.allowQr = true;
-          inst.silent = false;
-          if (!loggedOut && corruptAuth) {
-            console.warn(`🔐 Tenant ${id} auth was corrupt — requesting a fresh QR`);
-            inst.reconnectTimer = setTimeout(() => {
-              inst.reconnectTimer = null;
-              startTenantSession(id, {
-                syncGlobalQr: inst.syncGlobalQr,
-                allowQr: true,
-                silent: false,
-              }).catch((err) =>
-                console.error(`QR restart failed for tenant ${id}:`, redactSecrets(err))
+      const sock = makeWASocket({
+        auth: auth.state,
+        logger: baileysLogger,
+        printQRInTerminal: false,
+        markOnlineOnConnect: false,
+        syncFullHistory: false,
+        connectTimeoutMs: 30_000,
+        retryRequestDelayMs: 500,
+      });
+      inst.sock = sock;
+      inst.connectionStatus = 'connecting';
+      inst.lastUpdated = new Date().toISOString();
+      if (inst.syncGlobalQr) setConnectionStatus('connecting');
+
+      const isCurrent = () => inst.generation === generation && inst.sock === sock;
+
+      sock.ev.on('creds.update', auth.saveCreds);
+
+      sock.ev.on('connection.update', async (update) => {
+        if (!isCurrent()) return;
+        try {
+          const { connection, lastDisconnect, qr } = update;
+          if (qr) {
+            if (!inst.allowQr) {
+              inst.skipReconnect = true;
+              inst.qrDataUrl = null;
+              inst.connectionStatus = 'needs_scan';
+              inst.lastUpdated = new Date().toISOString();
+              console.log(
+                `♻️ Tenant ${id} is not linked anymore — open /dashboard and click Start to scan a new QR`
               );
-            }, 800);
-          }
-          return;
-        }
-
-        if (replaced || badSession) {
-          stopHeartbeat(inst);
-          releaseWhatsAppLock(id, WA_INSTANCE_ID).catch(() => {});
-          inst.connectionStatus = 'conflict';
-          inst.sock = null;
-          inst.skipReconnect = true;
-          console.warn(
-            `⚠️ Tenant ${id}: WhatsApp kicked this socket (${
-              replaced ? 'connection replaced / conflict' : 'bad session'
-            }). ` +
-              'Another bot instance owns this number. Not reconnecting — use Start on one server only.'
-          );
-          return;
-        }
-
-        if (inst.reconnectTimer) clearTimeout(inst.reconnectTimer);
-        const delay = reconnectDelayMs(inst.reconnectAttempt++);
-        inst.reconnectTimer = setTimeout(async () => {
-          inst.reconnectTimer = null;
-          try {
-            const live = await getTenantById(id);
-            if (live && !isTenantPlanActive(live)) {
-              inst.connectionStatus = 'disabled';
+              await disposeSocket(sock);
+              if (isCurrent()) inst.sock = null;
+              settle();
               return;
             }
-            await startTenantSession(id, {
-              syncGlobalQr: inst.syncGlobalQr,
-              allowQr: inst.allowQr,
-              silent: inst.silent,
-            });
-          } catch (err) {
-            console.error(`Reconnect failed for tenant ${id}:`, redactSecrets(err));
-            inst.reconnectTimer = setTimeout(
-              () =>
-                startTenantSession(id, {
+            if (!inst.silent) {
+              console.log(`📷 Tenant ${id} — scan WhatsApp QR at /dashboard`);
+            }
+            if (inst.syncGlobalQr && !inst.silent) {
+              qrcodeTerminal.generate(qr, { small: true });
+            }
+            try {
+              inst.qrDataUrl = await QRCode.toDataURL(qr, {
+                errorCorrectionLevel: 'M',
+                margin: 2,
+                width: 320,
+              });
+              inst.connectionStatus = 'waiting_for_scan';
+              inst.lastUpdated = new Date().toISOString();
+              if (inst.syncGlobalQr) setQr(qr, inst.qrDataUrl);
+            } catch (err) {
+              console.error('QR render failed:', err?.message || err);
+            }
+            settle();
+          }
+
+          if (connection === 'connecting' && isCurrent()) {
+            inst.connectionStatus = 'connecting';
+            if (inst.syncGlobalQr) setConnectionStatus('connecting');
+          }
+
+          if (connection === 'close') {
+            if (inst.loggingOut) {
+              inst.connectionStatus = 'logging_out';
+              inst.qrDataUrl = null;
+              settle();
+              return;
+            }
+            if (inst.skipReconnect) {
+              inst.skipReconnect = false;
+              inst.connectionStatus = 'needs_scan';
+              inst.qrDataUrl = null;
+              if (isCurrent()) inst.sock = null;
+              settle();
+              return;
+            }
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const errMsg = String(lastDisconnect?.error?.message || '');
+            const loggedOut = statusCode === DisconnectReason.loggedOut;
+            const replaced =
+              statusCode === DisconnectReason.connectionReplaced || /conflict|replaced/i.test(errMsg);
+            const badSession =
+              statusCode === DisconnectReason.badSession ||
+              /bad session|Stream Errored \(ack\)/i.test(errMsg);
+            const corruptAuth = /Incorrect private key length|not-authorized/i.test(errMsg);
+            inst.qrDataUrl = null;
+            inst.lastUpdated = new Date().toISOString();
+            if (inst.syncGlobalQr) clearQr(inst.connectionStatus);
+            stopHeartbeat(inst);
+            if (isCurrent()) inst.sock = null;
+            console.warn(
+              `🔌 Tenant ${id} disconnected (${disconnectLabel(statusCode)})` +
+                (lastDisconnect?.error?.message
+                  ? ` — ${redactSecrets(lastDisconnect.error.message)}`
+                  : '')
+            );
+
+            if (loggedOut || corruptAuth || badSession) {
+              try {
+                await baileysAuthClearAll(id);
+                fs.rmSync(authFolder(id), { recursive: true, force: true });
+                await setTenantLinkedWhatsapp(id, null);
+              } catch {
+                // ignore
+              }
+              inst.connectionStatus = 'logged_out';
+              inst.allowQr = true;
+              inst.silent = false;
+              console.warn(`🔐 Tenant ${id} session cleared — scan a fresh QR to re-link`);
+              if (!loggedOut) {
+                inst.reconnectTimer = setTimeout(() => {
+                  inst.reconnectTimer = null;
+                  startTenantSession(id, {
+                    syncGlobalQr: inst.syncGlobalQr,
+                    allowQr: true,
+                    silent: false,
+                    stealLock: true,
+                  }).catch((err) =>
+                    console.error(`QR restart failed for tenant ${id}:`, redactSecrets(err))
+                  );
+                }, 800);
+              }
+              settle();
+              return;
+            }
+
+            if (replaced) {
+              if (ownsHostRuntime) {
+                inst.selfReplaceCount = (inst.selfReplaceCount || 0) + 1;
+                if (inst.selfReplaceCount >= 3) {
+                  console.warn(
+                    `🧹 Tenant ${id}: repeated self-replace — wiping keys so a fresh QR can be scanned`
+                  );
+                  settle();
+                  resetTenantWhatsAppSession(id, { syncGlobalQr: inst.syncGlobalQr }).catch(() => {});
+                  return;
+                }
+                inst.connectionStatus = 'reconnecting';
+                console.warn(
+                  `⚠️ Tenant ${id}: WhatsApp replaced this socket (often a second makeWASocket in this process). Reconnecting after a pause.`
+                );
+                inst.reconnectTimer = setTimeout(() => {
+                  inst.reconnectTimer = null;
+                  startTenantSession(id, {
+                    syncGlobalQr: inst.syncGlobalQr,
+                    allowQr: inst.allowQr,
+                    silent: inst.silent,
+                    stealLock: true,
+                  }).catch(() => {});
+                }, 4000);
+              } else {
+                inst.connectionStatus = 'conflict';
+                releaseWhatsAppLock(id, WA_INSTANCE_ID).catch(() => {});
+                console.warn(
+                  `⚠️ Tenant ${id}: another live process owns this number. Use Reset Session on Super Admin if this host should take over.`
+                );
+              }
+              settle();
+              return;
+            }
+
+            inst.connectionStatus = 'reconnecting';
+            if (inst.reconnectTimer) clearTimeout(inst.reconnectTimer);
+            const delay = reconnectDelayMs(inst.reconnectAttempt++);
+            inst.reconnectTimer = setTimeout(async () => {
+              inst.reconnectTimer = null;
+              try {
+                const live = await getTenantById(id);
+                if (live && !isTenantPlanActive(live)) {
+                  inst.connectionStatus = 'disabled';
+                  return;
+                }
+                await startTenantSession(id, {
                   syncGlobalQr: inst.syncGlobalQr,
                   allowQr: inst.allowQr,
                   silent: inst.silent,
-                }).catch(() => {}),
-              reconnectDelayMs(inst.reconnectAttempt++)
-            );
+                  stealLock: true,
+                });
+              } catch (err) {
+                console.error(`Reconnect failed for tenant ${id}:`, redactSecrets(err));
+              }
+            }, delay);
+            settle();
+          } else if (connection === 'open') {
+            inst.reconnectAttempt = 0;
+            inst.selfReplaceCount = 0;
+            inst.qrDataUrl = null;
+            inst.connectionStatus = 'connected';
+            stopHeartbeat(inst);
+            inst.heartbeatTimer = setInterval(() => {
+              heartbeatWhatsAppLock(id, WA_INSTANCE_ID).catch(() => {});
+            }, 10_000);
+            inst.lastUpdated = new Date().toISOString();
+            inst.linkedJid = sock.user?.id || sock.user?.jid || null;
+            if (inst.linkedJid) {
+              setTenantLinkedWhatsapp(id, inst.linkedJid).catch(() => {});
+            }
+            if (inst.syncGlobalQr) clearQr('connected');
+            console.log(`✅ WhatsApp connected for tenant ${id} (${tenant?.business_name || 'n/a'})`);
+            settle();
           }
-        }, delay);
-      } else if (connection === 'open') {
-        inst.reconnectAttempt = 0;
-        inst.conflictCount = 0;
-        inst.qrDataUrl = null;
-        inst.connectionStatus = 'connected';
-        stopHeartbeat(inst);
-        inst.heartbeatTimer = setInterval(() => {
-          heartbeatWhatsAppLock(id, WA_INSTANCE_ID).catch(() => {});
-        }, 15_000);
-        inst.lastUpdated = new Date().toISOString();
-        inst.linkedJid = sock.user?.id || sock.user?.jid || null;
-        if (inst.linkedJid) {
-          setTenantLinkedWhatsapp(id, inst.linkedJid).catch(() => {});
+        } catch (err) {
+          console.warn(`connection.update error tenant ${id}:`, redactSecrets(err));
+          settle();
         }
-        if (inst.syncGlobalQr) clearQr('connected');
-        console.log(`✅ WhatsApp connected for tenant ${id} (${tenant?.business_name || 'n/a'})`);
-      }
-      } catch (err) {
-        console.warn(`connection.update error tenant ${id}:`, redactSecrets(err));
-      }
-    });
+      });
 
-    attachWhatsAppHandler(sock, {
-      tenant,
-      getTenant: () => getTenantById(id),
-    });
+      attachWhatsAppHandler(sock, {
+        tenant,
+        getTenant: () => getTenantById(id),
+      });
+
+      await Promise.race([settled, sleep(35_000)]);
     } catch (err) {
       inst.sock = null;
       inst.connectionStatus = 'reconnecting';
       console.error(`startTenantSession failed ${id}:`, redactSecrets(err));
+      try {
+        settle();
+      } catch {
+        // ignore
+      }
       const delay = reconnectDelayMs(inst.reconnectAttempt++);
       if (inst.reconnectTimer) clearTimeout(inst.reconnectTimer);
       inst.reconnectTimer = setTimeout(() => {
@@ -447,11 +510,11 @@ export async function startTenantSession(
           syncGlobalQr: inst.syncGlobalQr,
           allowQr: inst.allowQr,
           silent: inst.silent,
-        }).catch((e) =>
-          console.error(`Reconnect failed for tenant ${id}:`, redactSecrets(e))
-        );
+          stealLock: true,
+        }).catch((e) => console.error(`Reconnect failed for tenant ${id}:`, redactSecrets(e)));
       }, delay);
     }
+    return inst;
   })();
 
   try {
@@ -471,6 +534,7 @@ export async function stopTenantSession(
   const inst = instances.get(id);
   if (!inst) return { ok: true, message: 'No session running' };
 
+  inst.generation = (inst.generation || 0) + 1;
   inst.loggingOut = Boolean(logout);
   stopHeartbeat(inst);
   if (inst.reconnectTimer) {
@@ -482,24 +546,14 @@ export async function stopTenantSession(
   }
 
   const sock = inst.sock;
-  if (sock) {
-    try {
-      if (logout) await sock.logout();
-    } catch (err) {
-      console.warn(`tenant ${id} logout failed:`, err?.message || err);
-    }
-    try {
-      sock.end?.(undefined);
-    } catch {
-      // ignore
-    }
-    inst.sock = null;
-  }
+  inst.sock = null;
+  await disposeSocket(sock);
 
   if (logout) {
     try {
       await baileysAuthClearAll(id);
       fs.rmSync(authFolder(id), { recursive: true, force: true });
+      await setTenantLinkedWhatsapp(id, null);
     } catch (err) {
       console.warn(`tenant ${id} auth clear skipped:`, err?.message || err);
     }
@@ -522,7 +576,38 @@ export async function stopTenantSession(
   return { ok: true, message: logout ? 'Logged out. Scan a new QR to reconnect.' : 'Stopped' };
 }
 
+/** Wipe corrupt Baileys keys and show a fresh QR for this tenant only. */
+export async function resetTenantWhatsAppSession(tenantId, { syncGlobalQr = false } = {}) {
+  const id = String(tenantId);
+  console.log(`🧹 Reset WhatsApp session for tenant ${id}`);
+  await stopTenantSession(id, { logout: true, restart: false, syncGlobalQr });
+  await tryAcquireWhatsAppLock(id, WA_INSTANCE_ID, { steal: true });
+  return startTenantSession(id, {
+    allowQr: true,
+    silent: false,
+    syncGlobalQr,
+    stealLock: true,
+  });
+}
+
 export async function restoreAuthenticatedSessions() {
+  if (process.env.NODE_APP_INSTANCE && String(process.env.NODE_APP_INSTANCE) !== '0') {
+    console.warn('⏸️ Cluster worker is not instance 0 — skipping WhatsApp sockets');
+    return { restored: 0 };
+  }
+
+  await clearStaleWhatsAppLocks({ hostname: WA_HOSTNAME, maxAgeSeconds: 20 }).catch(() => {});
+  ownsHostRuntime = await claimHostRuntime(WA_HOSTNAME, WA_INSTANCE_ID, process.pid).catch(
+    () => true
+  );
+  if (!ownsHostRuntime) {
+    return { restored: 0 };
+  }
+  if (hostHeartbeatTimer) clearInterval(hostHeartbeatTimer);
+  hostHeartbeatTimer = setInterval(() => {
+    heartbeatHostRuntime(WA_HOSTNAME, WA_INSTANCE_ID).catch(() => {});
+  }, 10_000);
+
   const fromDb = await listTenantIdsWithBaileysCreds().catch(() => []);
   const fromDisk = [];
   const root = path.join(__dirname, 'baileys_auth_info');
@@ -559,10 +644,10 @@ export async function restoreAuthenticatedSessions() {
 
   console.log(`♻️ Restoring ${restore.length} saved WhatsApp session(s) in the background…`);
   for (const id of restore) {
-    startTenantSession(id, { allowQr: false, silent: true }).catch((err) =>
+    startTenantSession(id, { allowQr: false, silent: true, stealLock: true }).catch((err) =>
       console.warn(`Silent restore skipped for ${id}:`, redactSecrets(err))
     );
-    await sleep(1200);
+    await sleep(1500);
   }
   return { restored: restore.length };
 }

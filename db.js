@@ -268,6 +268,14 @@ export async function initDatabase() {
       heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bot_host_locks (
+      host TEXT PRIMARY KEY,
+      instance_id TEXT NOT NULL,
+      pid INTEGER,
+      heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 
   console.log('✅ PostgreSQL ready (tenants, tenant_leads, token_usage, user_sessions, baileys_auth)');
   await ensurePlatformTenant();
@@ -618,6 +626,70 @@ export async function releaseWhatsAppLock(tenantId, instanceId) {
     `DELETE FROM whatsapp_instance_locks WHERE tenant_id = $1 AND instance_id = $2`,
     [tenantId, instanceId]
   );
+}
+
+export async function clearStaleWhatsAppLocks({ hostname = null, maxAgeSeconds = 20 } = {}) {
+  const pool = await getPool();
+  if (!pool) return 0;
+  const stale = await pool.query(
+    `DELETE FROM whatsapp_instance_locks WHERE heartbeat_at < NOW() - ($1::int * INTERVAL '1 second')`,
+    [Math.max(5, Number(maxAgeSeconds) || 20)]
+  );
+  let hostGone = 0;
+  if (hostname) {
+    const dropped = await pool.query(
+      `DELETE FROM whatsapp_instance_locks WHERE instance_id LIKE $1`,
+      [`${hostname}:%`]
+    );
+    hostGone = dropped.rowCount || 0;
+  }
+  return (stale.rowCount || 0) + hostGone;
+}
+
+export async function claimHostRuntime(hostname, instanceId, pid) {
+  const pool = await getPool();
+  if (!pool || !hostname) return true;
+  await pool.query(
+    `DELETE FROM bot_host_locks WHERE heartbeat_at < NOW() - INTERVAL '20 seconds'`
+  );
+  const result = await pool.query(
+    `
+    INSERT INTO bot_host_locks (host, instance_id, pid, heartbeat_at)
+    VALUES ($1, $2, $3, NOW())
+    ON CONFLICT (host) DO UPDATE
+      SET instance_id = EXCLUDED.instance_id,
+          pid = EXCLUDED.pid,
+          heartbeat_at = NOW()
+      WHERE bot_host_locks.instance_id = EXCLUDED.instance_id
+         OR bot_host_locks.heartbeat_at < NOW() - INTERVAL '20 seconds'
+    RETURNING instance_id, pid
+    `,
+    [hostname, instanceId, pid]
+  );
+  const row = result.rows[0];
+  if (row?.instance_id === instanceId) return true;
+  console.warn(
+    `⏸️ Another Node process already owns WhatsApp on host ${hostname} (pid ${row?.pid || 'unknown'}). Skipping sockets here.`
+  );
+  return false;
+}
+
+export async function heartbeatHostRuntime(hostname, instanceId) {
+  const pool = await getPool();
+  if (!pool || !hostname || !instanceId) return;
+  await pool.query(
+    `UPDATE bot_host_locks SET heartbeat_at = NOW() WHERE host = $1 AND instance_id = $2`,
+    [hostname, instanceId]
+  );
+}
+
+export async function releaseHostRuntime(hostname, instanceId) {
+  const pool = await getPool();
+  if (!pool || !hostname || !instanceId) return;
+  await pool.query(`DELETE FROM bot_host_locks WHERE host = $1 AND instance_id = $2`, [
+    hostname,
+    instanceId,
+  ]);
 }
 
 export async function baileysAuthRemove(id, tenantId = null) {

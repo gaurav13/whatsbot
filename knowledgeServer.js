@@ -45,6 +45,7 @@ import {
   listWhatsAppInstances,
   ensureTenantSessionForUi,
   publicQrPayload,
+  resetTenantWhatsAppSession,
 } from './sessionManager.js';
 import { superAdminDashboardHtml } from './superAdminPage.js';
 import {
@@ -733,6 +734,15 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
         restart: false,
       });
       res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.post('/api/admin/tenants/:id/reset-whatsapp', async (req, res) => {
+    try {
+      await resetTenantWhatsAppSession(req.params.id, { syncGlobalQr: false });
+      res.json({ ok: true, ...getTenantQrState(req.params.id) });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message || String(err) });
     }

@@ -196,6 +196,7 @@ export function superAdminDashboardHtml() {
             '<button class="secondary" type="button" data-act="reset">Reset used</button>' +
             '<button class="secondary" type="button" data-act="toggle">' + (t.is_active && !expired ? 'Disable' : 'Enable') + '</button>' +
             '<button class="danger" type="button" data-act="disconnect">Disconnect WA</button>' +
+            '<button class="danger" type="button" data-act="resetwa">Reset Session &amp; Re-link</button>' +
             (t.is_platform
               ? ''
               : '<button class="danger" type="button" data-act="delete">Delete tenant</button>') +
@@ -255,6 +256,12 @@ export function superAdminDashboardHtml() {
           });
         } else if (act === 'disconnect') {
           res = await fetch('/api/admin/tenants/' + id + '/disconnect', { method: 'POST' });
+        } else if (act === 'resetwa') {
+          if (!confirm('Wipe this tenant’s WhatsApp keys and show a fresh QR? The phone must scan again.')) {
+            msg.textContent = '';
+            return;
+          }
+          res = await fetch('/api/admin/tenants/' + id + '/reset-whatsapp', { method: 'POST' });
         } else if (act === 'delete') {
           const name = (card.querySelector('.biz')?.textContent || 'this tenant').trim();
           if (!confirm('Delete ' + name + '? This cannot be undone. WhatsApp session, leads, and usage for this tenant will be removed.')) {
