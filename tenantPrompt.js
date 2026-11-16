@@ -1,4 +1,10 @@
-import { buildDemoSystemInstruction } from './demoProfiles.js';
+import {
+  buildDemoSystemInstruction,
+  getDemoWelcomePreview,
+  answerDemoChat,
+  getActiveDemoProfile,
+} from './demoProfiles.js';
+import { generateAiReply } from './aiRouter.js';
 
 const DESC_LIMIT = 8000;
 const KNOWLEDGE_LIMIT = 24000;
@@ -28,6 +34,9 @@ function tenantProfileId(tenant) {
  * Platform / empty profiles keep the existing Vilasa / GS AI templates.
  */
 export async function buildTenantSystemInstruction(tenant) {
+  if (tenant?.is_platform) {
+    return buildDemoSystemInstruction(getActiveDemoProfile().id);
+  }
   if (!hasTenantKnowledge(tenant)) {
     return buildDemoSystemInstruction(tenantProfileId(tenant));
   }
@@ -67,5 +76,72 @@ export async function buildTenantSystemInstruction(tenant) {
     },
     systemInstruction,
     knowledgeSource: tenant.knowledge_file_path || 'tenant-profile',
+  };
+}
+
+export async function previewTenantChat(tenant, question = '') {
+  const profileId = tenantProfileId(tenant);
+  const custom = hasTenantKnowledge(tenant);
+  let welcome = tenantWelcomeMessage(tenant);
+  let menuOptions = [];
+  if (!custom) {
+    const preview = await getDemoWelcomePreview(profileId);
+    welcome = preview.welcomeText || welcome;
+    menuOptions = preview.menuOptions || [];
+    if (preview.menuTitle) {
+      welcome = [
+        preview.welcomeText,
+        preview.menuTitle ? `*${preview.menuTitle}*` : '',
+        (preview.menuOptions || [])
+          .map((o) => `${o.index}) ${o.title}${o.description ? ' — ' + o.description : ''}`)
+          .join('\n'),
+        preview.hint || '',
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+    }
+  }
+
+  const q = String(question || '').trim();
+  if (!q) {
+    return {
+      welcome,
+      reply: welcome,
+      mode: 'welcome',
+      customKnowledge: custom,
+      menuOptions,
+      profileLabel: tenant?.business_name || 'Your business',
+    };
+  }
+
+  if (!custom) {
+    const demo = await answerDemoChat(q, profileId);
+    return {
+      welcome,
+      reply: demo.reply,
+      mode: demo.mode || 'ai',
+      customKnowledge: false,
+      menuOptions,
+      profileLabel: demo.profile?.label || tenant?.business_name,
+      knowledgeSource: demo.knowledgeSource,
+    };
+  }
+
+  const built = await buildTenantSystemInstruction(tenant);
+  const reply = await generateAiReply(q, built.systemInstruction, {
+    jid: `preview-${tenant.id}`,
+    phone: 'preview',
+    source: 'tenant-preview',
+    tenant,
+    tenantId: tenant.id,
+  });
+  return {
+    welcome,
+    reply,
+    mode: 'ai',
+    customKnowledge: true,
+    menuOptions,
+    profileLabel: tenant.business_name,
+    knowledgeSource: built.knowledgeSource,
   };
 }

@@ -232,7 +232,7 @@ export function demoPageHtml() {
     <div class="grid">
       <div class="card">
         <h2>1. Choose the story</h2>
-        <p class="hint">Pick a vertical, then activate the welcome menu the customer would see on WhatsApp.</p>
+        <p class="hint">Pick a vertical, then activate. This also switches the <strong>live operator WhatsApp number</strong> (the one from the main QR), so a real “hi” / “menu” on your phone follows this profile.</p>
         <label for="profileSelect">Active profile</label>
         <select id="profileSelect"></select>
         <div class="profiles" id="profileRadios"></div>
@@ -399,12 +399,14 @@ export function demoPageHtml() {
         profiles = profiles.map((p) => ({ ...p, active: p.id === activeProfileId }));
         renderProfileControls();
         renderWelcome(data.preview);
-        if (data.whatsapp?.ok) {
-          setStatus(profileStatus, 'Demo activated — WhatsApp welcome sent', 'ok');
-        } else if (data.whatsapp?.skipped) {
+        if (data.whatsapp?.ok && !data.whatsapp?.skipped) {
+          setStatus(profileStatus, 'Demo activated — WhatsApp welcome sent. Live operator number uses this profile too.', 'ok');
+        } else if (data.whatsapp?.skipped || data.liveMode) {
           setStatus(
             profileStatus,
-            'Demo is live on this page. Add a WhatsApp JID to push the same welcome to a phone.',
+            data.whatsapp?.message ||
+              ('Live operator WhatsApp is now ' + (data.profile?.label || 'this profile') +
+                '. Message that number with hi or menu. Optional: add a JID to push the welcome now.'),
             'ok'
           );
         } else if (data.whatsapp?.error) {

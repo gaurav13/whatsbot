@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { loadActiveKnowledgeBase } from './knowledgeManager.js';
-import { buildWebsiteKnowledgeContext } from './db.js';
+import { buildWebsiteKnowledgeContext, syncPlatformTenantDemoMode } from './db.js';
 import {
   loadVilasaBrochureText,
   getVilasaIntroMessage,
@@ -200,12 +200,26 @@ export async function getDemoWelcomePreview(profileId = activeProfileId) {
   };
 }
 
+export function getPlatformWhatsAppDemoId(tenant) {
+  if (!tenant?.is_platform) return null;
+  return getActiveDemoProfile().id;
+}
+
 export async function triggerDemoProfile(
   profileId,
   { pushToWhatsAppJid = null, trigger = true } = {}
 ) {
   const profile = setActiveDemoProfile(profileId);
   const preview = await getDemoWelcomePreview(profile.id);
+  const platform = await syncPlatformTenantDemoMode(profile.id).catch((err) => {
+    console.warn('Platform demo mode sync skipped:', err?.message || err);
+    return null;
+  });
+  if (platform) {
+    console.log(
+      `🎭 Live operator WhatsApp is now ${profile.label} (platform ${platform.business_type})`
+    );
+  }
 
   const jid = String(pushToWhatsAppJid || lastWhatsAppJid || '').trim() || null;
   if (jid) setLastDemoWhatsAppJid(jid);
@@ -222,13 +236,15 @@ export async function triggerDemoProfile(
     }
   } else if (trigger && !jid) {
     whatsapp = {
-      ok: false,
+      ok: true,
       skipped: true,
-      error: 'No WhatsApp JID set — preview only. Enter a JID to push the demo welcome live.',
+      liveMode: profile.id,
+      message:
+        'Live operator WhatsApp number now uses this profile. Message that number (hi / menu) to test. Optional: enter a JID to push the welcome now.',
     };
   }
 
-  return { profile, preview, whatsapp, lastWhatsAppJid: jid };
+  return { profile, preview, whatsapp, lastWhatsAppJid: jid, liveMode: profile.id };
 }
 
 export async function answerDemoChat(question, profileId = activeProfileId) {

@@ -26,6 +26,7 @@ import {
   createTenant,
   authenticateTenant,
   getPublicTenantById,
+  getTenantById,
   updateTenantSettings,
   updateTenantKnowledge,
   listTenantLeads,
@@ -71,6 +72,7 @@ import {
 } from './demoProfiles.js';
 import { listVilasaLeads } from './vilasaDemo.js';
 import { leadsToCsv } from './leadCapture.js';
+import { previewTenantChat } from './tenantPrompt.js';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -475,6 +477,31 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     res.json({ ok: true, tenant });
   });
 
+  app.get('/api/tenant/preview', requireTenant, async (req, res) => {
+    try {
+      const tenant = await getTenantById(req.session.tenantId);
+      if (!tenant) return res.status(404).json({ ok: false, error: 'Tenant not found' });
+      const preview = await previewTenantChat(tenant, '');
+      res.json({ ok: true, ...preview });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.post('/api/tenant/preview-chat', requireTenant, async (req, res) => {
+    try {
+      const question = String(req.body?.question || '').trim();
+      if (!question) return res.status(400).json({ ok: false, error: 'Enter a question' });
+      const tenant = await getTenantById(req.session.tenantId);
+      if (!tenant) return res.status(404).json({ ok: false, error: 'Tenant not found' });
+      const preview = await previewTenantChat(tenant, question);
+      res.json({ ok: true, ...preview });
+    } catch (err) {
+      console.error('tenant preview chat failed:', err?.message || err);
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
   app.post('/api/tenant/settings', requireTenant, async (req, res) => {
     try {
       const tenant = await updateTenantSettings(req.session.tenantId, req.body || {});
@@ -765,6 +792,7 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
         profile: result.profile,
         preview: result.preview,
         whatsapp: result.whatsapp,
+        liveMode: result.liveMode,
         lastWhatsAppJid: result.lastWhatsAppJid || getLastDemoWhatsAppJid(),
         triggered: req.body?.trigger !== false,
       });

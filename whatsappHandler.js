@@ -54,6 +54,7 @@ import {
   isBotOriginated,
 } from './whatsappSend.js';
 import { maybeCaptureContactFromMessage } from './leadCapture.js';
+import { getActiveDemoProfile, getPlatformWhatsAppDemoId } from './demoProfiles.js';
 
 const PORTFOLIO_TRIGGER =
   'hi gaurav, i visited your portfolio and want to discuss a project';
@@ -72,6 +73,7 @@ const WELCOME_MESSAGE =
   'Welcome to GS AI Solutions! How can I help you today? Tell me about your project — SEO, ads, AI automation, web development, Web3, or cloud infrastructure.';
 
 function tenantProfileId(tenant) {
+  if (tenant?.is_platform) return getActiveDemoProfile().id;
   return tenant?.business_type === 'real_estate' ? 'vilasa' : 'gsai';
 }
 
@@ -351,9 +353,12 @@ export function attachWhatsAppHandler(sock, { tenant, getTenant }) {
       const vilasaIntent = isVilasaIntent(messageText);
       const servicesIntent = isServicesMenuIntent(messageText);
       const demoStart = /^(demo|start|hi|hello|menu)$/i.test(messageText.trim());
-      const realEstate = liveTenant?.business_type === 'real_estate';
+      const platformDemoId = getPlatformWhatsAppDemoId(liveTenant);
+      const vilasaMode =
+        platformDemoId === 'vilasa' ||
+        (!platformDemoId && liveTenant?.business_type === 'real_estate');
       const platformFilter = Boolean(liveTenant?.is_platform);
-      const customKb = hasTenantKnowledge(liveTenant);
+      const customKb = hasTenantKnowledge(liveTenant) && !platformDemoId;
 
       if (
         platformFilter &&
@@ -376,7 +381,7 @@ export function attachWhatsAppHandler(sock, { tenant, getTenant }) {
             await recordHandledTurn(liveTenant, senderJid);
             return;
           }
-          if (realEstate || vilasaIntent) {
+          if (vilasaMode || vilasaIntent) {
             await startVilasaDemo(sock, senderJid, { sendWithTyping });
             await recordHandledTurn(liveTenant, senderJid);
             return;
@@ -391,6 +396,12 @@ export function attachWhatsAppHandler(sock, { tenant, getTenant }) {
           return;
         }
 
+        if (vilasaMode && (demoStart || vilasaIntent)) {
+          await startVilasaDemo(sock, senderJid, { sendWithTyping });
+          await recordHandledTurn(liveTenant, senderJid);
+          return;
+        }
+
         if (customKb) {
           const reply = await getAiReply(messageText, senderJid, liveTenant);
           await sendWithTyping(sock, senderJid, reply);
@@ -399,11 +410,12 @@ export function attachWhatsAppHandler(sock, { tenant, getTenant }) {
         }
 
         if (
-          await handleVilasaInteraction(sock, senderJid, messageText, {
+          (vilasaMode || getLeadIntake(senderJid)) &&
+          (await handleVilasaInteraction(sock, senderJid, messageText, {
             sendWithTyping,
             msg,
             tenant: liveTenant,
-          })
+          }))
         ) {
           await recordHandledTurn(liveTenant, senderJid);
           return;
@@ -446,6 +458,20 @@ async function recordHandledTurn(tenant, jid) {
 
 export async function pushTenantWelcome(sock, jid, tenant) {
   markTracked(jid);
+  if (tenant?.is_platform) {
+    const demoId = getActiveDemoProfile().id;
+    if (demoId === 'vilasa') {
+      await startVilasaDemo(sock, jid, { sendWithTyping });
+      return { mode: 'vilasa' };
+    }
+    await sendWithTyping(
+      sock,
+      jid,
+      `${WELCOME_MESSAGE}\n\nPlease choose a service, or type *services* for the pricing menu.`
+    );
+    await sendInteractiveServicesMenu(sock, jid);
+    return { mode: 'gsai' };
+  }
   if (hasTenantKnowledge(tenant)) {
     await sendWithTyping(sock, jid, tenantWelcomeMessage(tenant));
     return { mode: 'tenant-knowledge' };

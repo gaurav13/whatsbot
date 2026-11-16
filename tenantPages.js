@@ -41,6 +41,14 @@ const shell = (title, body) => `<!doctype html>
     th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
     th { color:var(--muted); font-weight:600; }
     .table-wrap { overflow-x:auto; max-height:420px; overflow-y:auto; }
+    .phone { background:#075e54; border-radius:22px; padding:12px 10px 16px; margin-top:10px; }
+    .phone-bar { color:#d1fae5; font-size:.82rem; font-weight:650; padding:6px 10px 12px; display:flex; justify-content:space-between; }
+    .chat { background:#0b141a; border-radius:14px; padding:12px; min-height:220px; max-height:340px; overflow:auto; }
+    .bubble { max-width:92%; margin:8px 0; padding:8px 11px; border-radius:12px; font-size:.9rem; line-height:1.4; white-space:pre-wrap; }
+    .bubble.user { margin-left:auto; background:#005c4b; color:#e7fff6; border-bottom-right-radius:4px; }
+    .bubble.ai { background:#1f2c34; color:#eef6fb; border-bottom-left-radius:4px; }
+    .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .chip { border:1px solid var(--line); background:#182433; color:var(--text); border-radius:999px; padding:7px 12px; font-size:.85rem; cursor:pointer; }
   </style>
 </head>
 <body>${body}</body>
@@ -156,7 +164,24 @@ export function tenantDashboardPage() {
       </div>
 
       <div class="card">
-        <h2 style="margin:0 0 10px;font-size:1.05rem">3) Link WhatsApp</h2>
+        <h2 style="margin:0 0 10px;font-size:1.05rem">3) Preview customer replies</h2>
+        <p class="meta" id="previewHint">See the same style of WhatsApp message your customers will get — welcome first, then try a question.</p>
+        <div class="phone">
+          <div class="phone-bar"><span id="previewPhoneName">Your WhatsApp assistant</span><span>preview</span></div>
+          <div class="chat" id="previewLog"></div>
+        </div>
+        <div class="chips" id="previewChips"></div>
+        <label for="previewQuestion">Try a customer question</label>
+        <textarea id="previewQuestion" placeholder="e.g. tell me about your location" style="min-height:70px"></textarea>
+        <div class="row">
+          <button id="previewAskBtn" type="button">Ask demo AI</button>
+          <button id="previewClearBtn" class="secondary" type="button">Clear chat</button>
+        </div>
+        <p class="meta" id="previewStatus"></p>
+      </div>
+
+      <div class="card">
+        <h2 style="margin:0 0 10px;font-size:1.05rem">4) Link WhatsApp</h2>
         <p class="meta" id="waStatus">Checking connection…</p>
         <div class="qr" id="qrBox">QR appears here after you start a session</div>
         <div class="row">
@@ -166,7 +191,7 @@ export function tenantDashboardPage() {
       </div>
 
       <div class="card">
-        <h2 style="margin:0 0 10px;font-size:1.05rem">4) Leads</h2>
+        <h2 style="margin:0 0 10px;font-size:1.05rem">5) Leads</h2>
         <p class="meta">Captured when a visitor finishes a booking flow or shares a name and phone number.</p>
         <div class="row">
           <button id="refreshLeadsBtn" class="secondary" type="button">Refresh</button>
@@ -297,6 +322,7 @@ export function tenantDashboardPage() {
         if (res.ok) {
           document.getElementById('knowledgeFile').value = '';
           loadMe();
+          loadWelcomePreview();
         }
       };
 
@@ -353,7 +379,90 @@ export function tenantDashboardPage() {
 
       document.getElementById('refreshLeadsBtn').onclick = () => loadLeads();
 
+      function previewEsc(value) {
+        return String(value == null ? '' : value)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+      }
+
+      async function loadWelcomePreview() {
+        const log = document.getElementById('previewLog');
+        const status = document.getElementById('previewStatus');
+        try {
+          const res = await fetch('/api/tenant/preview');
+          if (res.status === 401) return;
+          const data = await res.json();
+          document.getElementById('previewPhoneName').textContent =
+            (data.profileLabel || 'Your assistant') + ' · WhatsApp';
+          document.getElementById('previewHint').textContent = data.customKnowledge
+            ? 'Answers use your saved knowledge base — the same content WhatsApp will send.'
+            : 'No custom knowledge yet, so this preview uses the default industry template. Save a profile in step 2 to see your own replies.';
+          log.innerHTML = '<div class="bubble ai">' + previewEsc(data.welcome || data.reply || '') + '</div>';
+          const chips = document.getElementById('previewChips');
+          const options = data.menuOptions && data.menuOptions.length
+            ? data.menuOptions
+            : [
+                { id: 'tell me about your location', title: 'Location' },
+                { id: 'what do you offer?', title: 'Services' },
+                { id: 'what is the price?', title: 'Pricing' }
+              ];
+          chips.innerHTML = options.map((o) =>
+            '<button class="chip" type="button" data-q="' + previewEsc(o.id || o.title) + '">' +
+            previewEsc(o.title) + '</button>'
+          ).join('');
+          chips.querySelectorAll('.chip').forEach((btn) => {
+            btn.onclick = () => {
+              document.getElementById('previewQuestion').value = btn.dataset.q;
+              document.getElementById('previewAskBtn').click();
+            };
+          });
+          status.textContent = 'Welcome preview ready — try a customer question below.';
+        } catch (err) {
+          status.textContent = err.message || 'Preview failed';
+        }
+      }
+
+      document.getElementById('previewClearBtn').onclick = () => {
+        document.getElementById('previewLog').innerHTML = '';
+        loadWelcomePreview();
+      };
+
+      document.getElementById('previewAskBtn').onclick = async () => {
+        const question = document.getElementById('previewQuestion').value.trim();
+        const status = document.getElementById('previewStatus');
+        if (!question) {
+          status.textContent = 'Enter a question first.';
+          return;
+        }
+        const log = document.getElementById('previewLog');
+        const btn = document.getElementById('previewAskBtn');
+        btn.disabled = true;
+        status.textContent = 'Thinking with your knowledge base…';
+        log.innerHTML += '<div class="bubble user">' + previewEsc(question) + '</div>';
+        try {
+          const res = await fetch('/api/tenant/preview-chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ question })
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || 'Preview failed');
+          log.innerHTML += '<div class="bubble ai">' + previewEsc(data.reply || '') + '</div>';
+          log.scrollTop = log.scrollHeight;
+          status.textContent = 'This is the type of reply a customer would get on WhatsApp' +
+            (data.mode ? ' · ' + data.mode : '') + '.';
+          status.className = 'meta ok';
+        } catch (err) {
+          status.textContent = err.message || 'Preview failed';
+          status.className = 'meta';
+        } finally {
+          btn.disabled = false;
+        }
+      };
+
       loadMe();
+      loadWelcomePreview();
       loadLeads();
       pollQr();
       setInterval(pollQr, 2500);

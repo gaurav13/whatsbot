@@ -1296,6 +1296,23 @@ export async function findRecentTenantLead({ tenantId, customerPhone, withinHour
   return result.rows[0] || null;
 }
 
+export async function syncPlatformTenantDemoMode(profileId) {
+  const pool = await getPool();
+  if (!pool) return null;
+  const vilasa = String(profileId || '') === 'vilasa';
+  const result = await pool.query(
+    `
+    UPDATE tenants
+    SET business_type = $1,
+        business_category = $2
+    WHERE is_platform = TRUE
+    RETURNING id, business_name, business_type, business_category
+    `,
+    [vilasa ? 'real_estate' : 'it_services', vilasa ? 'real_estate' : 'it_software']
+  );
+  return result.rows[0] || null;
+}
+
 export async function ensurePlatformTenant() {
   const pool = await getPool();
   if (!pool) return null;
