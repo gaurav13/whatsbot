@@ -10,6 +10,7 @@ import {
   sendTenantDemo,
   getSock,
   restoreAuthenticatedSessions,
+  WA_INSTANCE_ID,
 } from './sessionManager.js';
 import { redactSecrets } from './whatsappSend.js';
 import { startBillingScheduler } from './billingScheduler.js';
@@ -20,6 +21,7 @@ const bootAi = peekActiveAi();
 console.log(
   `⚙️  Active AI: ${bootAi.activeProvider || 'n/a'} / ${bootAi.activeModel || 'n/a'}`
 );
+console.log(`🪪 WhatsApp instance: ${WA_INSTANCE_ID}`);
 if (!bootAiConfig.providers?.[bootAi.activeProvider || '']?.apiKey) {
   console.warn(
     '⚠️  Active AI provider has no API key yet. Add one at /admin or a tenant Gemini key.'
@@ -50,7 +52,7 @@ indexVilasaKnowledge()
 
 function isSocketNoise(err) {
   const msg = redactSecrets(err);
-  return /Connection Closed|Timed Out|Precondition Required|Stream Errored|conflict|Connection Terminated|not-authorized|bad-session|restart required/i.test(
+  return /Connection Closed|Timed Out|Precondition Required|Stream Errored|conflict|Connection Terminated|not-authorized|bad-session|restart required|Bad MAC|Failed to decrypt/i.test(
     msg
   );
 }

@@ -537,6 +537,7 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
         ...ensureTenantSessionForUi(id, {
           syncGlobalQr: false,
           forceQr: Boolean(req.body?.relink),
+          stealLock: true,
         }),
       });
     } catch (err) {

@@ -131,7 +131,7 @@ export function tenantDashboardPage() {
             .join('')}
         </select>
         <label>Custom API key (BYOK — optional)</label>
-        <input id="customApiKey" placeholder="Leave blank to keep current / use the platform master key" />
+        <input id="customApiKey" type="password" autocomplete="off" placeholder="Paste a provider API key, or leave as-is to keep the saved key" />
         <p class="meta" id="keyMeta"></p>
         <p class="meta" id="quotaMeta"></p>
         <label>Owner alert WhatsApp number</label>
@@ -204,9 +204,24 @@ export function tenantDashboardPage() {
         document.getElementById('businessCategory').value = t.business_category || 'general';
         document.getElementById('aiProvider').value = t.ai_provider || 'deepseek';
         document.getElementById('aiModel').value = t.ai_model || '';
-        document.getElementById('keyMeta').textContent = t.has_custom_api_key
-          ? ('BYOK key on file: ' + t.custom_api_key_masked + ' · provider ' + (t.ai_provider || 'deepseek'))
-          : 'No tenant key — using the platform master key for this provider';
+        const keyInput = document.getElementById('customApiKey');
+        const keyMeta = document.getElementById('keyMeta');
+        if (t.has_custom_api_key) {
+          keyInput.value = '••••••••••••';
+          keyInput.dataset.unchanged = '1';
+          keyInput.placeholder = 'Key on file — paste a new key only if you want to replace it';
+          keyMeta.textContent =
+            'BYOK key on file: ' + (t.custom_api_key_masked || '••••') +
+            ' · provider ' + (t.ai_provider || 'deepseek') +
+            '. The dots mean a key is already active; leave them to keep it.';
+          keyMeta.className = 'meta ok';
+        } else {
+          keyInput.value = '';
+          keyInput.dataset.unchanged = '0';
+          keyInput.placeholder = 'Paste your provider API key (optional BYOK)';
+          keyMeta.textContent = 'No tenant key on file — using the platform master key for this provider.';
+          keyMeta.className = 'meta';
+        }
         document.getElementById('quotaMeta').textContent =
           'Messages used: ' + (t.messages_used || 0) + ' / ' + (t.message_quota || 0) +
           ' · Platform tokens: ' + t.tokens_used + ' / ' + t.token_quota +
@@ -219,6 +234,10 @@ export function tenantDashboardPage() {
           : 'No file uploaded yet';
         document.getElementById('alertPhone').value = t.alert_phone || '';
       }
+
+      document.getElementById('customApiKey').addEventListener('input', (e) => {
+        e.target.dataset.unchanged = '0';
+      });
 
       async function pollQr() {
         const res = await fetch('/api/tenant/qr.json');
@@ -248,8 +267,10 @@ export function tenantDashboardPage() {
           ai_provider: document.getElementById('aiProvider').value,
           ai_model: document.getElementById('aiModel').value
         };
-        const customKey = document.getElementById('customApiKey').value.trim();
-        if (customKey) body.custom_api_key = customKey;
+        const keyInput = document.getElementById('customApiKey');
+        const customKey = keyInput.value.trim();
+        const masked = keyInput.dataset.unchanged === '1' || /^[•\u2022*·]+$/.test(customKey);
+        if (customKey && !masked) body.custom_api_key = customKey;
         const res = await fetch('/api/tenant/settings', {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
         });

@@ -1,5 +1,7 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import makeWASocket, { DisconnectReason } from '@whiskeysockets/baileys';
 import pino from 'pino';
@@ -13,6 +15,9 @@ import {
   isTenantPlanActive,
   listTenantIdsWithBaileysCreds,
   ensurePlatformTenant,
+  tryAcquireWhatsAppLock,
+  heartbeatWhatsAppLock,
+  releaseWhatsAppLock,
 } from './db.js';
 import { attachWhatsAppHandler, pushTenantWelcome } from './whatsappHandler.js';
 import { setQr, clearQr, setConnectionStatus } from './qrState.js';
@@ -21,6 +26,16 @@ import { redactSecrets } from './whatsappSend.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const baileysLogger = pino({ level: 'silent' });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export const WA_INSTANCE_ID =
+  process.env.WA_INSTANCE_ID ||
+  `${os.hostname()}:${process.pid}:${crypto.randomBytes(3).toString('hex')}`;
+
+function stopHeartbeat(inst) {
+  if (inst?.heartbeatTimer) {
+    clearInterval(inst.heartbeatTimer);
+    inst.heartbeatTimer = null;
+  }
+}
 
 /** @type {Map<string, { sock: any, tenantId: string, qrDataUrl: string|null, connectionStatus: string, reconnectTimer: any, bootPromise: any, lastUpdated: string, loggingOut: boolean }>} */
 const instances = new Map();
@@ -105,6 +120,7 @@ export function publicQrPayload(state = {}) {
   else if (connecting) displayStatus = 'Connecting…';
   else if (['logged_out', 'stopped'].includes(connectionStatus)) displayStatus = 'Disconnected';
   else if (connectionStatus === 'disabled') displayStatus = 'Disabled';
+  else if (connectionStatus === 'conflict') displayStatus = 'Taken over by another bot instance';
   return {
     ...state,
     connectionStatus,
@@ -119,7 +135,10 @@ export function publicQrPayload(state = {}) {
  * Open a dashboard/QR page: keep a live session, or start one that is allowed
  * to emit a QR when creds are missing, expired, or the user asked to relink.
  */
-export function ensureTenantSessionForUi(tenantId, { syncGlobalQr = false, forceQr = false } = {}) {
+export function ensureTenantSessionForUi(
+  tenantId,
+  { syncGlobalQr = false, forceQr = false, stealLock = false } = {}
+) {
   const id = String(tenantId || '');
   if (!id) return publicQrPayload({ connectionStatus: 'stopped' });
 
@@ -131,6 +150,10 @@ export function ensureTenantSessionForUi(tenantId, { syncGlobalQr = false, force
   inst.allowQr = true;
   inst.silent = false;
   if (syncGlobalQr) inst.syncGlobalQr = true;
+
+  if (inst.connectionStatus === 'conflict' && !forceQr && !stealLock) {
+    return getTenantQrState(id);
+  }
 
   if (forceQr) {
     stopTenantSession(id, {
@@ -159,6 +182,7 @@ export function ensureTenantSessionForUi(tenantId, { syncGlobalQr = false, force
       allowQr: true,
       silent: false,
       syncGlobalQr: Boolean(inst.syncGlobalQr),
+      stealLock: Boolean(stealLock || forceQr),
     }).catch((err) => console.warn('QR session start failed:', redactSecrets(err)));
   }
 
@@ -171,7 +195,7 @@ export function getSock(tenantId) {
 
 export async function startTenantSession(
   tenantId,
-  { syncGlobalQr = false, allowQr = true, silent = false } = {}
+  { syncGlobalQr = false, allowQr = true, silent = false, stealLock = false } = {}
 ) {
   const id = String(tenantId);
   let inst = instances.get(id);
@@ -201,6 +225,15 @@ export async function startTenantSession(
     if (tenant && !isTenantPlanActive(tenant)) {
       inst.connectionStatus = 'disabled';
       inst.sock = null;
+      return inst;
+    }
+    const gotLock = await tryAcquireWhatsAppLock(id, WA_INSTANCE_ID, { steal: stealLock });
+    if (!gotLock) {
+      inst.connectionStatus = 'conflict';
+      inst.sock = null;
+      console.warn(
+        `⏸️ Tenant ${id} WhatsApp is already running on another instance — not connecting here`
+      );
       return inst;
     }
     const folder = authFolder(id);
@@ -288,7 +321,10 @@ export async function startTenantSession(
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const errMsg = String(lastDisconnect?.error?.message || '');
         const loggedOut = statusCode === DisconnectReason.loggedOut;
-        const replaced = statusCode === DisconnectReason.connectionReplaced;
+        const replaced =
+          statusCode === DisconnectReason.connectionReplaced ||
+          /conflict|replaced/i.test(errMsg);
+        const badSession = statusCode === DisconnectReason.badSession;
         const corruptAuth = /Incorrect private key length|bad-session|not-authorized/i.test(
           errMsg
         );
@@ -330,10 +366,23 @@ export async function startTenantSession(
           return;
         }
 
+        if (replaced || badSession) {
+          stopHeartbeat(inst);
+          releaseWhatsAppLock(id, WA_INSTANCE_ID).catch(() => {});
+          inst.connectionStatus = 'conflict';
+          inst.sock = null;
+          inst.skipReconnect = true;
+          console.warn(
+            `⚠️ Tenant ${id}: WhatsApp kicked this socket (${
+              replaced ? 'connection replaced / conflict' : 'bad session'
+            }). ` +
+              'Another bot instance owns this number. Not reconnecting — use Start on one server only.'
+          );
+          return;
+        }
+
         if (inst.reconnectTimer) clearTimeout(inst.reconnectTimer);
-        const delay = replaced
-          ? 15_000
-          : reconnectDelayMs(inst.reconnectAttempt++);
+        const delay = reconnectDelayMs(inst.reconnectAttempt++);
         inst.reconnectTimer = setTimeout(async () => {
           inst.reconnectTimer = null;
           try {
@@ -362,8 +411,13 @@ export async function startTenantSession(
         }, delay);
       } else if (connection === 'open') {
         inst.reconnectAttempt = 0;
+        inst.conflictCount = 0;
         inst.qrDataUrl = null;
         inst.connectionStatus = 'connected';
+        stopHeartbeat(inst);
+        inst.heartbeatTimer = setInterval(() => {
+          heartbeatWhatsAppLock(id, WA_INSTANCE_ID).catch(() => {});
+        }, 15_000);
         inst.lastUpdated = new Date().toISOString();
         inst.linkedJid = sock.user?.id || sock.user?.jid || null;
         if (inst.linkedJid) {
@@ -418,9 +472,13 @@ export async function stopTenantSession(
   if (!inst) return { ok: true, message: 'No session running' };
 
   inst.loggingOut = Boolean(logout);
+  stopHeartbeat(inst);
   if (inst.reconnectTimer) {
     clearTimeout(inst.reconnectTimer);
     inst.reconnectTimer = null;
+  }
+  if (!restart) {
+    await releaseWhatsAppLock(id, WA_INSTANCE_ID).catch(() => {});
   }
 
   const sock = inst.sock;
@@ -458,6 +516,7 @@ export async function stopTenantSession(
       allowQr: true,
       silent: false,
       syncGlobalQr: Boolean(syncGlobalQr),
+      stealLock: true,
     });
   }
   return { ok: true, message: logout ? 'Logged out. Scan a new QR to reconnect.' : 'Stopped' };

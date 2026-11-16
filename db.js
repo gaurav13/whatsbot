@@ -1,7 +1,14 @@
 import dns from 'dns/promises';
 import pg from 'pg';
 import 'dotenv/config';
-import { hashPassword, verifyPassword, encryptSecret, decryptSecret, maskSecret } from './tenantCrypto.js';
+import {
+  hashPassword,
+  verifyPassword,
+  encryptSecret,
+  decryptSecret,
+  maskSecret,
+  isUnchangedSecret,
+} from './tenantCrypto.js';
 import {
   normalizeBusinessCategory,
   businessTypeFromCategory,
@@ -253,6 +260,14 @@ export async function initDatabase() {
   `);
 
   await migrateBaileysAuthPrimaryKey(pool);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS whatsapp_instance_locks (
+      tenant_id UUID PRIMARY KEY,
+      instance_id TEXT NOT NULL,
+      heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 
   console.log('✅ PostgreSQL ready (tenants, tenant_leads, token_usage, user_sessions, baileys_auth)');
   await ensurePlatformTenant();
@@ -528,18 +543,81 @@ export async function baileysAuthRead(id, tenantId = null) {
 export async function baileysAuthWrite(id, value, tenantId = null) {
   const pool = await getPool();
   if (!pool) return false;
-  await pool.query(`DELETE FROM baileys_auth WHERE id = $1 AND tenant_id IS NOT DISTINCT FROM $2::uuid`, [
-    id,
-    tenantId,
-  ]);
-  await pool.query(
-    `
-    INSERT INTO baileys_auth (id, value, tenant_id, updated_at)
-    VALUES ($1, $2::jsonb, $3, NOW());
-    `,
-    [id, JSON.stringify(value), tenantId]
+  const payload = JSON.stringify(value);
+  const updated = await pool.query(
+    `UPDATE baileys_auth
+     SET value = $2::jsonb, updated_at = NOW()
+     WHERE id = $1 AND tenant_id IS NOT DISTINCT FROM $3::uuid`,
+    [id, payload, tenantId]
   );
+  if (updated.rowCount) return true;
+  try {
+    await pool.query(
+      `
+      INSERT INTO baileys_auth (id, value, tenant_id, updated_at)
+      VALUES ($1, $2::jsonb, $3, NOW());
+      `,
+      [id, payload, tenantId]
+    );
+  } catch (err) {
+    if (err?.code !== '23505') throw err;
+    await pool.query(
+      `UPDATE baileys_auth
+       SET value = $2::jsonb, updated_at = NOW()
+       WHERE id = $1 AND tenant_id IS NOT DISTINCT FROM $3::uuid`,
+      [id, payload, tenantId]
+    );
+  }
   return true;
+}
+
+export async function tryAcquireWhatsAppLock(tenantId, instanceId, { steal = false } = {}) {
+  const pool = await getPool();
+  if (!pool || !tenantId || !instanceId) return true;
+  if (steal) {
+    await pool.query(
+      `
+      INSERT INTO whatsapp_instance_locks (tenant_id, instance_id, heartbeat_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (tenant_id) DO UPDATE
+        SET instance_id = EXCLUDED.instance_id, heartbeat_at = NOW()
+      `,
+      [tenantId, instanceId]
+    );
+    return true;
+  }
+  const result = await pool.query(
+    `
+    INSERT INTO whatsapp_instance_locks (tenant_id, instance_id, heartbeat_at)
+    VALUES ($1, $2, NOW())
+    ON CONFLICT (tenant_id) DO UPDATE
+      SET instance_id = EXCLUDED.instance_id, heartbeat_at = NOW()
+      WHERE whatsapp_instance_locks.instance_id = EXCLUDED.instance_id
+         OR whatsapp_instance_locks.heartbeat_at < NOW() - INTERVAL '45 seconds'
+    RETURNING instance_id
+    `,
+    [tenantId, instanceId]
+  );
+  return result.rows[0]?.instance_id === instanceId;
+}
+
+export async function heartbeatWhatsAppLock(tenantId, instanceId) {
+  const pool = await getPool();
+  if (!pool || !tenantId || !instanceId) return;
+  await pool.query(
+    `UPDATE whatsapp_instance_locks SET heartbeat_at = NOW()
+     WHERE tenant_id = $1 AND instance_id = $2`,
+    [tenantId, instanceId]
+  );
+}
+
+export async function releaseWhatsAppLock(tenantId, instanceId) {
+  const pool = await getPool();
+  if (!pool || !tenantId || !instanceId) return;
+  await pool.query(
+    `DELETE FROM whatsapp_instance_locks WHERE tenant_id = $1 AND instance_id = $2`,
+    [tenantId, instanceId]
+  );
 }
 
 export async function baileysAuthRemove(id, tenantId = null) {
@@ -719,14 +797,18 @@ export async function updateTenantSettings(id, patch = {}) {
   const email =
     patch.email !== undefined ? normalizeOptionalEmail(patch.email) : current.email;
 
+  const geminiIncoming = patch.geminiApiKey ?? patch.gemini_api_key;
+  const groqIncoming = patch.groqApiKey ?? patch.groq_api_key;
   const gemini =
-    patch.geminiApiKey === undefined && patch.gemini_api_key === undefined
+    geminiIncoming === undefined ||
+    isUnchangedSecret(geminiIncoming, maskSecret(decryptSecret(current.gemini_api_key)))
       ? current.gemini_api_key
-      : encryptSecret(patch.geminiApiKey ?? patch.gemini_api_key);
+      : encryptSecret(geminiIncoming);
   const groq =
-    patch.groqApiKey === undefined && patch.groq_api_key === undefined
+    groqIncoming === undefined ||
+    isUnchangedSecret(groqIncoming, maskSecret(decryptSecret(current.groq_api_key)))
       ? current.groq_api_key
-      : encryptSecret(patch.groqApiKey ?? patch.groq_api_key);
+      : encryptSecret(groqIncoming);
 
   const businessName =
     patch.businessName || patch.business_name || current.business_name;
@@ -748,7 +830,8 @@ export async function updateTenantSettings(id, patch = {}) {
   let customKey = current.custom_api_key;
   if (patch.custom_api_key !== undefined || patch.customApiKey !== undefined) {
     const next = patch.custom_api_key ?? patch.customApiKey;
-    if (String(next || '').trim()) customKey = encryptSecret(next);
+    const masked = maskSecret(decryptSecret(current.custom_api_key));
+    if (!isUnchangedSecret(next, masked)) customKey = encryptSecret(next);
   }
 
   const pool = await getPool();
@@ -995,8 +1078,11 @@ export async function adminUpdateTenant(id, patch = {}) {
   const aiModel =
     patch.ai_model !== undefined ? String(patch.ai_model || '').trim() || null : current.ai_model;
   let customKey = current.custom_api_key;
-  if (patch.custom_api_key !== undefined && String(patch.custom_api_key || '').trim()) {
-    customKey = encryptSecret(patch.custom_api_key);
+  if (patch.custom_api_key !== undefined) {
+    const masked = maskSecret(decryptSecret(current.custom_api_key));
+    if (!isUnchangedSecret(patch.custom_api_key, masked)) {
+      customKey = encryptSecret(patch.custom_api_key);
+    }
   }
 
   const result = await pool.query(

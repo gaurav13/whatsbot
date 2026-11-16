@@ -58,3 +58,14 @@ export function maskSecret(value) {
   if (text.length <= 8) return '********';
   return `${text.slice(0, 4)}…${text.slice(-4)}`;
 }
+
+/** True when the client sent a blank/masked placeholder instead of a new key. */
+export function isUnchangedSecret(value, currentMasked = '') {
+  const v = String(value ?? '').trim();
+  if (!v) return true;
+  if (/^[•\u2022\u25CF*·∙.…]{6,}$/u.test(v)) return true;
+  if (/…/.test(v) || /\.{3}/.test(v)) return true;
+  const masked = String(currentMasked || '').trim();
+  if (masked && v === masked) return true;
+  return false;
+}
