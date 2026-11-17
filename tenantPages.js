@@ -278,7 +278,7 @@ export function tenantDashboardPage() {
         if (connected) box.textContent = 'Connected';
         else if (data.qrDataUrl) box.innerHTML = '<img alt="WhatsApp QR" src="' + data.qrDataUrl + '" />';
         else if (['connecting', 'starting', 'reconnecting'].includes(data.connectionStatus))
-          box.textContent = 'Connecting existing session…';
+          box.textContent = 'Connecting existing session… (new QR in 15s if this fails)';
         else box.textContent = 'Requesting a fresh QR…';
       }
 

@@ -234,7 +234,7 @@ function qrPageHtml() {
           hintEl.textContent = 'Clearing the old session and requesting a fresh QR.';
         } else if (connecting) {
           qrEl.innerHTML = '<p style="color:#93a4b5;font-weight:600;margin:0">Connecting existing session…</p>';
-          hintEl.textContent = 'Reusing a saved WhatsApp link. A QR will appear only if WhatsApp asks to re-link.';
+          hintEl.textContent = 'Trying the saved link. If this takes more than 15 seconds, we wipe the bad session and show a new QR.';
         } else {
           qrEl.innerHTML = '<p style="color:#93a4b5;margin:0">Requesting a fresh QR…</p>';
           hintEl.textContent = 'Previous session is disconnected or expired. This page auto-refreshes.';

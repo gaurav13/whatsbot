@@ -45,6 +45,73 @@ function stopHeartbeat(inst) {
   }
 }
 
+function clearConnectWatchdog(inst) {
+  if (inst?.connectWatchdog) {
+    clearTimeout(inst.connectWatchdog);
+    inst.connectWatchdog = null;
+  }
+}
+
+async function wipeTenantAuth(id) {
+  try {
+    await baileysAuthClearAll(id);
+  } catch {
+    // ignore
+  }
+  try {
+    fs.rmSync(authFolder(id), { recursive: true, force: true });
+  } catch {
+    // ignore
+  }
+  try {
+    await setTenantLinkedWhatsapp(id, null);
+  } catch {
+    // ignore
+  }
+}
+
+function scheduleFreshQr(id, inst, { settle, reason } = {}) {
+  if ((inst.authWipeCount || 0) >= 2) {
+    inst.connectionStatus = 'needs_scan';
+    inst.allowQr = true;
+    inst.silent = false;
+    console.warn(`🔐 Tenant ${id} already wiped twice — waiting for Start / refresh QR`);
+    try {
+      settle?.();
+    } catch {
+      // ignore
+    }
+    return;
+  }
+  inst.authWipeCount = (inst.authWipeCount || 0) + 1;
+  inst.generation = (inst.generation || 0) + 1;
+  inst.allowQr = true;
+  inst.silent = false;
+  inst.connectionStatus = 'needs_scan';
+  inst.qrDataUrl = null;
+  inst.skipReconnect = true;
+  try {
+    settle?.();
+  } catch {
+    // ignore
+  }
+  const sock = inst.sock;
+  inst.sock = null;
+  console.warn(`🔐 Tenant ${id}: ${reason || 'session failed'} — wiping auth and requesting a fresh QR`);
+  wipeTenantAuth(id)
+    .then(() => disposeSocket(sock))
+    .then(async () => {
+      for (let i = 0; i < 40 && inst.bootPromise; i += 1) await sleep(50);
+      return startTenantSession(id, {
+        allowQr: true,
+        silent: false,
+        stealLock: true,
+        syncGlobalQr: inst.syncGlobalQr,
+      });
+    })
+    .catch((err) => console.error(`Fresh QR restart failed for ${id}:`, redactSecrets(err)));
+}
+
 /** @type {Map<string, object>} */
 const instances = new Map();
 
@@ -250,6 +317,7 @@ export async function startTenantSession(
         inst.reconnectTimer = null;
       }
       stopHeartbeat(inst);
+      clearConnectWatchdog(inst);
       const previous = inst.sock;
       inst.sock = null;
       await disposeSocket(previous);
@@ -274,10 +342,22 @@ export async function startTenantSession(
       const folder = authFolder(id);
       fs.mkdirSync(folder, { recursive: true });
       const legacyRoot = path.join(__dirname, 'baileys_auth_info');
-      const auth = await loadBaileysAuthState(folder, id, {
-        silent: inst.silent,
-        fallbackFolder: tenant?.is_platform ? legacyRoot : null,
-      });
+      let auth;
+      try {
+        auth = await loadBaileysAuthState(folder, id, {
+          silent: inst.silent,
+          fallbackFolder: tenant?.is_platform ? legacyRoot : null,
+        });
+      } catch (err) {
+        console.warn(
+          `🔐 Tenant ${id} auth load failed (${redactSecrets(err?.message || err)}) — wiping and pairing fresh`
+        );
+        await wipeTenantAuth(id);
+        inst.allowQr = true;
+        inst.silent = false;
+        fs.mkdirSync(folder, { recursive: true });
+        auth = await loadBaileysAuthState(folder, id, { silent: false });
+      }
 
       const sock = makeWASocket({
         auth: auth.state,
@@ -295,6 +375,14 @@ export async function startTenantSession(
 
       const isCurrent = () => inst.generation === generation && inst.sock === sock;
 
+      clearConnectWatchdog(inst);
+      inst.connectWatchdog = setTimeout(() => {
+        if (!isCurrent()) return;
+        if (inst.connectionStatus === 'connected' || inst.qrDataUrl) return;
+        console.warn(`⏱️ Tenant ${id} still connecting after 15s — wiping corrupt auth and emitting a fresh QR`);
+        scheduleFreshQr(id, inst, { settle, reason: 'connect hung > 15s' });
+      }, 15_000);
+
       sock.ev.on('creds.update', auth.saveCreds);
 
       sock.ev.on('connection.update', async (update) => {
@@ -303,16 +391,10 @@ export async function startTenantSession(
           const { connection, lastDisconnect, qr } = update;
           if (qr) {
             if (!inst.allowQr) {
-              inst.skipReconnect = true;
-              inst.qrDataUrl = null;
-              inst.connectionStatus = 'needs_scan';
-              inst.lastUpdated = new Date().toISOString();
-              console.log(
-                `♻️ Tenant ${id} is not linked anymore — open /dashboard and click Start to scan a new QR`
-              );
-              await disposeSocket(sock);
-              if (isCurrent()) inst.sock = null;
-              settle();
+              scheduleFreshQr(id, inst, {
+                settle,
+                reason: 'saved session asked for a QR (corrupt or logged out)',
+              });
               return;
             }
             if (!inst.silent) {
@@ -322,6 +404,7 @@ export async function startTenantSession(
               qrcodeTerminal.generate(qr, { small: true });
             }
             try {
+              clearConnectWatchdog(inst);
               inst.qrDataUrl = await QRCode.toDataURL(qr, {
                 errorCorrectionLevel: 'M',
                 margin: 2,
@@ -358,12 +441,15 @@ export async function startTenantSession(
             }
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const errMsg = String(lastDisconnect?.error?.message || '');
+            clearConnectWatchdog(inst);
             const loggedOut = statusCode === DisconnectReason.loggedOut;
             const replaced =
               statusCode === DisconnectReason.connectionReplaced || /conflict|replaced/i.test(errMsg);
+            const neverOpened = !inst.hadOpenSession;
+            const timedOut = statusCode === DisconnectReason.timedOut && neverOpened;
             const badSession =
               statusCode === DisconnectReason.badSession ||
-              /bad session|Stream Errored \(ack\)/i.test(errMsg);
+              /bad session|Stream Errored|Bad MAC|Failed to decrypt/i.test(errMsg);
             const corruptAuth = /Incorrect private key length|not-authorized/i.test(errMsg);
             inst.qrDataUrl = null;
             inst.lastUpdated = new Date().toISOString();
@@ -377,32 +463,15 @@ export async function startTenantSession(
                   : '')
             );
 
-            if (loggedOut || corruptAuth || badSession) {
-              try {
-                await baileysAuthClearAll(id);
-                fs.rmSync(authFolder(id), { recursive: true, force: true });
-                await setTenantLinkedWhatsapp(id, null);
-              } catch {
-                // ignore
-              }
-              inst.connectionStatus = 'logged_out';
-              inst.allowQr = true;
-              inst.silent = false;
-              console.warn(`🔐 Tenant ${id} session cleared — scan a fresh QR to re-link`);
-              if (!loggedOut) {
-                inst.reconnectTimer = setTimeout(() => {
-                  inst.reconnectTimer = null;
-                  startTenantSession(id, {
-                    syncGlobalQr: inst.syncGlobalQr,
-                    allowQr: true,
-                    silent: false,
-                    stealLock: true,
-                  }).catch((err) =>
-                    console.error(`QR restart failed for tenant ${id}:`, redactSecrets(err))
-                  );
-                }, 800);
-              }
-              settle();
+            if (loggedOut || corruptAuth || badSession || timedOut) {
+              scheduleFreshQr(id, inst, {
+                settle,
+                reason: timedOut
+                  ? 'connect timeout'
+                  : loggedOut
+                    ? 'logged out'
+                    : 'corrupt/decrypt failure',
+              });
               return;
             }
 
@@ -464,8 +533,11 @@ export async function startTenantSession(
             }, delay);
             settle();
           } else if (connection === 'open') {
+            clearConnectWatchdog(inst);
             inst.reconnectAttempt = 0;
             inst.selfReplaceCount = 0;
+            inst.authWipeCount = 0;
+            inst.hadOpenSession = true;
             inst.qrDataUrl = null;
             inst.connectionStatus = 'connected';
             stopHeartbeat(inst);
@@ -537,6 +609,7 @@ export async function stopTenantSession(
   inst.generation = (inst.generation || 0) + 1;
   inst.loggingOut = Boolean(logout);
   stopHeartbeat(inst);
+  clearConnectWatchdog(inst);
   if (inst.reconnectTimer) {
     clearTimeout(inst.reconnectTimer);
     inst.reconnectTimer = null;

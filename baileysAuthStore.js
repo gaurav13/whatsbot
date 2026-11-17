@@ -40,8 +40,18 @@ export async function usePostgresAuthState(tenantId = null) {
   const readData = async (id) => {
     try {
       const value = await baileysAuthRead(id, tenantId);
+      if (value == null) return null;
       return deserialize(value);
-    } catch {
+    } catch (err) {
+      console.warn(
+        `🔐 Dropping unreadable Baileys key ${id} for tenant=${tenantId}:`,
+        err?.message || err
+      );
+      try {
+        await baileysAuthRemove(id, tenantId);
+      } catch {
+        // ignore
+      }
       return null;
     }
   };
@@ -54,7 +64,13 @@ export async function usePostgresAuthState(tenantId = null) {
     }
   };
 
-  const creds = (await readData('creds')) || initAuthCreds();
+  let creds = await readData('creds');
+  if (creds && !credsKeysLookValid(creds)) {
+    console.warn(`🔐 Corrupt noise keys for tenant=${tenantId} — wiping Baileys auth`);
+    await baileysAuthClearAll(tenantId);
+    creds = initAuthCreds();
+  }
+  if (!creds) creds = initAuthCreds();
 
   return {
     state: {
@@ -66,7 +82,12 @@ export async function usePostgresAuthState(tenantId = null) {
             ids.map(async (id) => {
               let value = await readData(`${type}-${id}`);
               if (type === 'app-state-sync-key' && value) {
-                value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                try {
+                  value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                } catch {
+                  value = null;
+                  await removeData(`${type}-${id}`);
+                }
               }
               data[id] = value;
             })
@@ -181,8 +202,18 @@ export async function loadBaileysAuthState(
   try {
     pgState = await usePostgresAuthState(tenantId);
   } catch (err) {
+    const msg = String(err?.message || err);
+    if (/Bad MAC|Failed to decrypt|Incorrect private key/i.test(msg)) {
+      console.warn(`🔐 Corrupt Postgres auth for tenant=${tenantId}: ${msg}`);
+      try {
+        await baileysAuthClearAll(tenantId);
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
     if (!silent) {
-      console.warn('Postgres Baileys auth unavailable, using files:', err?.message || err);
+      console.warn('Postgres Baileys auth unavailable, using files:', msg);
     }
   }
 
