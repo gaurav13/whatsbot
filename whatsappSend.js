@@ -1,3 +1,5 @@
+import { isEvolutionEnabled, sendWhatsAppContent, sendPresence, jidToNumber, instanceNameForTenant } from './services/evolutionGateway.js';
+
 const lastInboundAt = new Map();
 const RATE_MIN_MS = 3500;
 const botOutboundIds = new Set();
@@ -33,6 +35,28 @@ export function isBotOriginated(msg, jid) {
   return (botSendDepth.get(String(jid || msg?.key?.remoteJid || '')) || 0) > 0;
 }
 
+function evolutionTenantId(sock) {
+  if (sock?.__evolution && sock.tenantId) return sock.tenantId;
+  return null;
+}
+
+async function dispatchSend(sock, jid, content, options) {
+  const tenantId = evolutionTenantId(sock);
+  if (tenantId || (isEvolutionEnabled() && sock?.tenantId)) {
+    const id = tenantId || sock.tenantId;
+    const result = await sendWhatsAppContent(id, jid, content);
+    return {
+      key: {
+        id: result?.key?.id || result?.keyId || result?.id || `evo-${Date.now()}`,
+        remoteJid: jid,
+        fromMe: true,
+      },
+      result,
+    };
+  }
+  return sock.sendMessage(jid, content, options);
+}
+
 export function wrapSocketSend(sock) {
   if (sock.__botSendWrapped) return sock;
   const original = sock.sendMessage.bind(sock);
@@ -52,8 +76,13 @@ export function wrapSocketSend(sock) {
 
 export async function withComposing(sock, jid, sendFn) {
   try {
-    await sock.presenceSubscribe(jid);
-    await sock.sendPresenceUpdate('composing', jid);
+    if (sock?.__evolution || (isEvolutionEnabled() && sock?.tenantId)) {
+      const id = sock.tenantId;
+      await sendPresence(instanceNameForTenant(id), jidToNumber(jid), 'composing');
+    } else {
+      await sock.presenceSubscribe(jid);
+      await sock.sendPresenceUpdate('composing', jid);
+    }
   } catch {
     // presence is best-effort
   }
@@ -64,7 +93,11 @@ export async function withComposing(sock, jid, sendFn) {
     return await sendFn();
   } finally {
     try {
-      await sock.sendPresenceUpdate('paused', jid);
+      if (sock?.__evolution || (isEvolutionEnabled() && sock?.tenantId)) {
+        await sendPresence(instanceNameForTenant(sock.tenantId), jidToNumber(jid), 'paused');
+      } else {
+        await sock.sendPresenceUpdate('paused', jid);
+      }
     } catch {
       // ignore
     }
@@ -72,7 +105,16 @@ export async function withComposing(sock, jid, sendFn) {
 }
 
 export async function sendWithTyping(sock, jid, text) {
-  return withComposing(sock, jid, () => sock.sendMessage(jid, { text }));
+  return withComposing(sock, jid, async () => {
+    beginBotSend(jid);
+    try {
+      const sent = await dispatchSend(sock, jid, { text });
+      rememberBotMessage(sent);
+      return sent;
+    } finally {
+      endBotSend(jid);
+    }
+  });
 }
 
 /**

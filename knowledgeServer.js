@@ -47,6 +47,15 @@ import {
   publicQrPayload,
   resetTenantWhatsAppSession,
 } from './sessionManager.js';
+import { registerEvolutionWebhook } from './routes/evolutionWebhook.js';
+import {
+  isEvolutionEnabled,
+  ensureEvolutionSessionForUi,
+  getEvolutionSession,
+  logoutEvolutionSession,
+  resetEvolutionSession,
+  listEvolutionInstances,
+} from './services/evolutionGateway.js';
 import { superAdminDashboardHtml } from './superAdminPage.js';
 import {
   getPublicAiSettings,
@@ -302,8 +311,10 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
   // Required behind Nginx so secure cookies / client IP work correctly
   app.set('trust proxy', 1);
 
-  app.use(express.json());
-  app.use(express.urlencoded({ extended: false }));
+  // Evolution QRCODE_UPDATED webhooks include a full PNG as base64 (often >1MB).
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ extended: false, limit: '50mb' }));
+  registerEvolutionWebhook(app);
   app.use(
     session({
       name: 'gsai.sid',
@@ -549,13 +560,34 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     }
   );
 
-  app.get('/api/tenant/qr.json', requireTenant, (req, res) => {
-    res.json(ensureTenantSessionForUi(req.session.tenantId, { syncGlobalQr: false }));
+  app.get('/api/tenant/qr.json', requireTenant, async (req, res) => {
+    try {
+      if (isEvolutionEnabled()) {
+        const state = await ensureEvolutionSessionForUi(req.session.tenantId, {
+          syncGlobalQr: false,
+        });
+        return res.json(publicQrPayload(state));
+      }
+      res.json(ensureTenantSessionForUi(req.session.tenantId, { syncGlobalQr: false }));
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || String(err) });
+    }
   });
 
   app.post('/api/tenant/whatsapp/start', requireTenant, async (req, res) => {
     try {
       const id = req.session.tenantId;
+      if (isEvolutionEnabled()) {
+        const current = publicQrPayload(getEvolutionSession(id));
+        if (current.connected && !req.body?.relink) {
+          return res.json({ ok: true, ...current });
+        }
+        const state = await ensureEvolutionSessionForUi(id, {
+          syncGlobalQr: false,
+          forceQr: Boolean(req.body?.relink),
+        });
+        return res.json({ ok: true, ...publicQrPayload(state) });
+      }
       const current = getTenantQrState(id);
       if (current.connected && !req.body?.relink) {
         return res.json({ ok: true, ...current });
@@ -600,6 +632,13 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
 
   app.post('/api/tenant/whatsapp/logout', requireTenant, async (req, res) => {
     try {
+      if (isEvolutionEnabled()) {
+        const result = await logoutEvolutionSession(req.session.tenantId, {
+          restart: true,
+          syncGlobalQr: false,
+        });
+        return res.json({ ok: true, ...result, ...publicQrPayload(getEvolutionSession(req.session.tenantId)) });
+      }
       const result = await stopTenantSession(req.session.tenantId, {
         logout: true,
         restart: true,
@@ -635,6 +674,10 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     try {
       const platform = await ensurePlatformTenant();
       if (platform?.id) {
+        if (isEvolutionEnabled()) {
+          const state = await ensureEvolutionSessionForUi(platform.id, { syncGlobalQr: true });
+          return res.json(publicQrPayload(state));
+        }
         return res.json(
           ensureTenantSessionForUi(platform.id, { syncGlobalQr: true })
         );
@@ -649,7 +692,11 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     try {
       const platform = await ensurePlatformTenant();
       const state = platform?.id
-        ? ensureTenantSessionForUi(platform.id, { syncGlobalQr: true })
+        ? isEvolutionEnabled()
+          ? publicQrPayload(
+              await ensureEvolutionSessionForUi(platform.id, { syncGlobalQr: true })
+            )
+          : ensureTenantSessionForUi(platform.id, { syncGlobalQr: true })
         : publicQrPayload(getQrState());
       if (!state.qrDataUrl) return res.status(404).send('QR not available yet');
       const base64 = state.qrDataUrl.replace(/^data:image\/png;base64,/, '');
@@ -688,7 +735,10 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     try {
       const tenants = await listTenantsAdmin();
       const sessions = new Map(
-        listWhatsAppInstances().map((s) => [String(s.tenantId), s])
+        (isEvolutionEnabled() ? listEvolutionInstances() : listWhatsAppInstances()).map((s) => [
+          String(s.tenantId),
+          s,
+        ])
       );
       res.json({
         ok: true,
@@ -717,9 +767,17 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     try {
       const tenant = await adminUpdateTenant(req.params.id, req.body || {});
       if (req.body?.is_active === false) {
-        await stopTenantSession(req.params.id, { logout: false, restart: false });
+        if (isEvolutionEnabled()) {
+          await logoutEvolutionSession(req.params.id, { restart: false });
+        } else {
+          await stopTenantSession(req.params.id, { logout: false, restart: false });
+        }
       } else if (req.body?.is_active === true || Number(req.body?.renew_days) > 0) {
-        startTenantSession(req.params.id, { allowQr: false, silent: true }).catch(() => {});
+        if (isEvolutionEnabled()) {
+          ensureEvolutionSessionForUi(req.params.id).catch(() => {});
+        } else {
+          startTenantSession(req.params.id, { allowQr: false, silent: true }).catch(() => {});
+        }
       }
       res.json({ ok: true, tenant });
     } catch (err) {
@@ -729,6 +787,10 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
 
   app.post('/api/admin/tenants/:id/disconnect', async (req, res) => {
     try {
+      if (isEvolutionEnabled()) {
+        const result = await logoutEvolutionSession(req.params.id, { restart: false });
+        return res.json({ ok: true, ...result });
+      }
       const result = await stopTenantSession(req.params.id, {
         logout: true,
         restart: false,
@@ -741,6 +803,13 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
 
   app.post('/api/admin/tenants/:id/reset-whatsapp', async (req, res) => {
     try {
+      if (isEvolutionEnabled()) {
+        const state = await resetEvolutionSession(req.params.id, {
+          restart: true,
+          syncGlobalQr: false,
+        });
+        return res.json({ ok: true, ...publicQrPayload(state) });
+      }
       await resetTenantWhatsAppSession(req.params.id, { syncGlobalQr: false });
       res.json({ ok: true, ...getTenantQrState(req.params.id) });
     } catch (err) {
@@ -750,6 +819,9 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
 
   app.delete('/api/admin/tenants/:id', async (req, res) => {
     try {
+      if (isEvolutionEnabled()) {
+        await resetEvolutionSession(req.params.id, { restart: false }).catch(() => {});
+      }
       await destroyTenantRuntime(req.params.id);
       const result = await deleteTenant(req.params.id);
       try {
@@ -976,7 +1048,17 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
   });
 
   // Keep connections from dying silently on handler errors
-  app.use((err, _req, res, _next) => {
+  app.use((err, req, res, _next) => {
+    const tooLarge =
+      err?.type === 'entity.too.large' || err?.name === 'PayloadTooLargeError';
+    if (tooLarge) {
+      console.warn('Request entity too large:', req.method, req.path, err.message);
+      if (res.headersSent) return;
+      if (String(req.path || '').startsWith('/webhooks/')) {
+        return res.status(200).json({ ok: false, error: 'payload_too_large' });
+      }
+      return res.status(413).json({ ok: false, error: 'request entity too large' });
+    }
     console.error('Express error:', err?.stack || err);
     if (res.headersSent) return;
     res.status(500).type('html').send('<h1>Server error</h1><p>Check PM2 logs.</p>');
@@ -995,6 +1077,9 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     console.log(`⚙️  AI Settings: http://127.0.0.1:${port}/admin`);
     console.log(`🧪 Website Demo: http://127.0.0.1:${port}/demo`);
     console.log(`📂 Knowledge folder: ${KNOWLEDGE_DIR}`);
+    if (isEvolutionEnabled()) {
+      console.log(`📡 Evolution webhook: http://127.0.0.1:${port}/webhooks/evolution`);
+    }
   });
 
   server.on('error', (err) => {

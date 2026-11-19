@@ -213,11 +213,10 @@ function isStartKeyword(text) {
   return /^(start|resume|!start|!resume)$/i.test(String(text || '').trim());
 }
 
-export function attachWhatsAppHandler(sock, { tenant, getTenant }) {
-  wrapSocketSend(sock);
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    const msg = messages[0];
+export async function handleMessagesUpsert(sock, { messages, type } = {}, { tenant, getTenant } = {}) {
+    wrapSocketSend(sock);
+    if (type && type !== 'notify' && type !== 'append') return;
+    const msg = messages?.[0];
     if (!msg?.message) return;
     const chatJid = msg.key.remoteJid;
     if (!chatJid || chatJid === 'status@broadcast' || chatJid.endsWith('@g.us')) return;
@@ -444,6 +443,14 @@ export function attachWhatsAppHandler(sock, { tenant, getTenant }) {
         }
       }
     });
+}
+
+export function attachWhatsAppHandler(sock, { tenant, getTenant }) {
+  wrapSocketSend(sock);
+  sock.ev.on('messages.upsert', (upsert) => {
+    handleMessagesUpsert(sock, upsert, { tenant, getTenant }).catch((err) =>
+      console.error('messages.upsert failed:', redactSecrets(err?.message || err))
+    );
   });
 }
 

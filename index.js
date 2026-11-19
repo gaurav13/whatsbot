@@ -3,7 +3,7 @@ import { startKnowledgeServer } from './knowledgeServer.js';
 import { setLogoutHandler } from './sessionControl.js';
 import { peekActiveAi } from './aiRouter.js';
 import { loadAiConfig } from './aiConfigStore.js';
-import { initDatabase, ensurePlatformTenant } from './db.js';
+import { initDatabase, ensurePlatformTenant, getTenantById } from './db.js';
 import { indexVilasaKnowledge } from './vilasaDemo.js';
 import {
   stopTenantSession,
@@ -12,6 +12,13 @@ import {
   restoreAuthenticatedSessions,
   WA_INSTANCE_ID,
 } from './sessionManager.js';
+import {
+  isEvolutionEnabled,
+  logoutEvolutionSession,
+  getEvolutionSock,
+  isEvolutionConnected,
+} from './services/evolutionGateway.js';
+import { pushTenantWelcome } from './whatsappHandler.js';
 import { redactSecrets } from './whatsappSend.js';
 import { startBillingScheduler } from './billingScheduler.js';
 import { setDemoWhatsAppTrigger } from './demoProfiles.js';
@@ -33,12 +40,24 @@ let platformTenantId = null;
 setLogoutHandler(async (tenantId) => {
   const id = tenantId || platformTenantId;
   if (!id) throw new Error('No tenant session to reset');
+  if (isEvolutionEnabled()) {
+    return logoutEvolutionSession(id, { restart: true, syncGlobalQr: true });
+  }
   return stopTenantSession(id, { logout: true, restart: true, syncGlobalQr: true });
 });
 
 setDemoWhatsAppTrigger(async ({ profileId, jid }) => {
   const id = platformTenantId;
-  if (!id || !getSock(id)) {
+  if (!id) return { ok: false, error: 'WhatsApp is not connected yet' };
+  if (isEvolutionEnabled()) {
+    if (!isEvolutionConnected(id)) {
+      return { ok: false, error: 'WhatsApp is not connected yet' };
+    }
+    const tenant = await getTenantById(id);
+    const result = await pushTenantWelcome(getEvolutionSock(id), jid, tenant);
+    return { ok: true, ...result, jid };
+  }
+  if (!getSock(id)) {
     return { ok: false, error: 'WhatsApp is not connected yet' };
   }
   return sendTenantDemo(id, jid);
@@ -90,6 +109,10 @@ if (platform?.id) {
   console.warn('⚠️ No platform tenant — start a client session from /dashboard');
 }
 
-restoreAuthenticatedSessions().catch((err) =>
-  console.warn('Session restore skipped:', err?.message || err)
-);
+if (isEvolutionEnabled()) {
+  console.log('📡 WHATSAPP_PROVIDER=evolution — native Baileys restore is skipped');
+} else {
+  restoreAuthenticatedSessions().catch((err) =>
+    console.warn('Session restore skipped:', err?.message || err)
+  );
+}

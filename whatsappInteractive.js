@@ -41,6 +41,23 @@ export async function sendInteractiveMenu(sock, jid, options) {
     description: String(r.description || '').slice(0, 72),
   }));
 
+  const fallback =
+    textFallback ||
+    [
+      `*${title}*`,
+      body,
+      '',
+      ...normalizedRows.map((r, i) => `${i + 1}) ${r.title}`),
+      '',
+      'Reply with a number or option name.',
+    ].join('\n');
+
+  if (sock?.__evolution) {
+    await sock.sendMessage(jid, { text: fallback });
+    console.log(`📝 Sent Evolution text menu "${title}" to ${jid}`);
+    return { type: 'text' };
+  }
+
   // 1) Modern interactive list (nativeFlow single_select)
   try {
     await relayNativeSingleSelect(sock, jid, {
@@ -87,17 +104,6 @@ export async function sendInteractiveMenu(sock, jid, options) {
   }
 
   // 4) Numbered text fallback
-  const fallback =
-    textFallback ||
-    [
-      `*${title}*`,
-      body,
-      '',
-      ...normalizedRows.map((r, i) => `${i + 1}) ${r.title}`),
-      '',
-      'Reply with a number or option name.',
-    ].join('\n');
-
   await sock.sendMessage(jid, { text: fallback });
   console.log(`📝 Sent text menu fallback "${title}" to ${jid}`);
   return { type: 'text' };
