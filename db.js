@@ -196,6 +196,7 @@ export async function initDatabase() {
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS custom_api_key TEXT;`);
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS phone TEXT;`);
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS business_category TEXT;`);
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS quick_replies JSONB;`);
   await pool.query(`ALTER TABLE tenants ALTER COLUMN email DROP NOT NULL;`);
   await pool.query(`
     UPDATE tenants
@@ -746,6 +747,35 @@ function publicTenant(row) {
     gemini_api_key_masked: maskSecret(gemini),
     groq_api_key_masked: maskSecret(groq),
     custom_api_key_masked: maskSecret(decryptSecret(row.custom_api_key)),
+    quick_replies: normalizeQuickRepliesColumn(row.quick_replies, row.business_category),
+  };
+}
+
+function normalizeQuickRepliesColumn(value, category) {
+  const raw = value && typeof value === 'object' ? value : {};
+  const buttonsIn = Array.isArray(raw.buttons) ? raw.buttons : [];
+  const buttons = [1, 2, 3, 4].map((n) => {
+    const row = buttonsIn.find((b) => Number(b?.number) === n) || buttonsIn[n - 1] || {};
+    const keywords = Array.isArray(row.keywords)
+      ? row.keywords
+      : String(row.keywords || '')
+          .split(/[,|]/)
+          .map((k) => k.trim())
+          .filter(Boolean);
+    return {
+      id: String(row.id || `opt_${n}`),
+      number: n,
+      label: String(row.label || '').trim().slice(0, 40),
+      keywords: keywords.map((k) => String(k).trim()).filter(Boolean).slice(0, 12),
+      reply: String(row.reply || '').trim().slice(0, 4000),
+      link: String(row.link || '').trim().slice(0, 500),
+    };
+  });
+  return {
+    enabled: Boolean(raw.enabled),
+    preset: String(raw.preset || category || 'general'),
+    welcome_extra: String(raw.welcome_extra || '').trim().slice(0, 400),
+    buttons,
   };
 }
 
@@ -906,6 +936,11 @@ export async function updateTenantSettings(id, patch = {}) {
     if (!isUnchangedSecret(next, masked)) customKey = encryptSecret(next);
   }
 
+  const quickReplies =
+    patch.quick_replies !== undefined || patch.quickReplies !== undefined
+      ? normalizeQuickRepliesColumn(patch.quick_replies ?? patch.quickReplies, category)
+      : normalizeQuickRepliesColumn(current.quick_replies, category);
+
   const pool = await getPool();
   const result = await pool.query(
     `
@@ -920,7 +955,8 @@ export async function updateTenantSettings(id, patch = {}) {
         alert_phone = $9,
         ai_provider = $10,
         ai_model = $11,
-        custom_api_key = $12
+        custom_api_key = $12,
+        quick_replies = $13::jsonb
     WHERE id = $1
     RETURNING *;
     `,
@@ -937,6 +973,7 @@ export async function updateTenantSettings(id, patch = {}) {
       aiProvider || 'deepseek',
       aiModel,
       customKey,
+      JSON.stringify(quickReplies),
     ]
   );
   return publicTenant(result.rows[0]);

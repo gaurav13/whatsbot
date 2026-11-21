@@ -49,6 +49,12 @@ const shell = (title, body) => `<!doctype html>
     .bubble.ai { background:#1f2c34; color:#eef6fb; border-bottom-left-radius:4px; }
     .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
     .chip { border:1px solid var(--line); background:#182433; color:var(--text); border-radius:999px; padding:7px 12px; font-size:.85rem; cursor:pointer; }
+    .qr-row { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
+    @media (max-width:720px) { .qr-row { grid-template-columns: 1fr; } }
+    .toggle { display:flex; align-items:center; gap:10px; color:var(--text); font-weight:650; margin:8px 0 14px; }
+    .toggle input { width:auto; }
+    .opt-card { border:1px solid var(--line); border-radius:12px; padding:12px; margin-bottom:10px; background:#0e1620; }
+    .opt-card h3 { margin:0 0 8px; font-size:.95rem; color:#9fd4ff; }
   </style>
 </head>
 <body>${body}</body>
@@ -164,7 +170,24 @@ export function tenantDashboardPage() {
       </div>
 
       <div class="card">
-        <h2 style="margin:0 0 10px;font-size:1.05rem">3) Preview customer replies</h2>
+        <h2 style="margin:0 0 10px;font-size:1.05rem">3) Quick Buttons (1–4)</h2>
+        <p class="meta">Customers reply with <strong>1, 2, 3, 4</strong> (or a keyword like “price”) and WhatsApp sends the message you write here. No flow builder needed — just edit the text.</p>
+        <label class="toggle"><input id="qrEnabled" type="checkbox" /> Show these numbered options after the welcome message</label>
+        <div class="row">
+          <button id="qrLoadPresetBtn" class="secondary" type="button">Use template for my category</button>
+        </div>
+        <p class="meta" id="qrPresetHint"></p>
+        <div id="qrButtons"></div>
+        <label>Short hint under the list (optional)</label>
+        <input id="qrWelcomeExtra" placeholder="e.g. Reply with a number or type price / visit" />
+        <div class="row">
+          <button id="qrSaveBtn" type="button">Save quick buttons</button>
+        </div>
+        <p class="meta" id="qrStatus"></p>
+      </div>
+
+      <div class="card">
+        <h2 style="margin:0 0 10px;font-size:1.05rem">4) Preview customer replies</h2>
         <p class="meta" id="previewHint">See the same style of WhatsApp message your customers will get — welcome first, then try a question.</p>
         <div class="phone">
           <div class="phone-bar"><span id="previewPhoneName">Your WhatsApp assistant</span><span>preview</span></div>
@@ -181,7 +204,7 @@ export function tenantDashboardPage() {
       </div>
 
       <div class="card">
-        <h2 style="margin:0 0 10px;font-size:1.05rem">4) Link WhatsApp</h2>
+        <h2 style="margin:0 0 10px;font-size:1.05rem">5) Link WhatsApp</h2>
         <p class="meta" id="waStatus">Checking connection…</p>
         <div class="qr" id="qrBox">QR appears here after you start a session</div>
         <div class="row">
@@ -191,7 +214,7 @@ export function tenantDashboardPage() {
       </div>
 
       <div class="card">
-        <h2 style="margin:0 0 10px;font-size:1.05rem">5) Leads</h2>
+        <h2 style="margin:0 0 10px;font-size:1.05rem">6) Leads</h2>
         <p class="meta">Captured when a visitor finishes a booking flow or shares a name and phone number.</p>
         <div class="row">
           <button id="refreshLeadsBtn" class="secondary" type="button">Refresh</button>
@@ -215,6 +238,13 @@ export function tenantDashboardPage() {
       </div>
     </div>
     <script>
+      function htmlEsc(value) {
+        return String(value == null ? '' : value)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
       async function loadMe() {
         const res = await fetch('/api/tenant/me');
         if (res.status === 401) return location.href = '/login';
@@ -258,7 +288,106 @@ export function tenantDashboardPage() {
           ? ('Last uploaded file: ' + t.knowledge_file_path)
           : 'No file uploaded yet';
         document.getElementById('alertPhone').value = t.alert_phone || '';
+        fillQuickReplies(t.quick_replies, t.business_category);
       }
+
+      function defaultQrButtons() {
+        return [1, 2, 3, 4].map((n) => ({
+          id: 'opt_' + n,
+          number: n,
+          label: '',
+          keywords: [],
+          reply: '',
+          link: ''
+        }));
+      }
+
+      function fillQuickReplies(cfg, category) {
+        const data = cfg && typeof cfg === 'object' ? cfg : {};
+        const buttons = Array.isArray(data.buttons) && data.buttons.length
+          ? data.buttons
+          : defaultQrButtons();
+        document.getElementById('qrEnabled').checked = Boolean(data.enabled);
+        document.getElementById('qrWelcomeExtra').value = data.welcome_extra || '';
+        const host = document.getElementById('qrButtons');
+        host.innerHTML = [1, 2, 3, 4].map((n) => {
+          const row = buttons.find((b) => Number(b.number) === n) || buttons[n - 1] || {};
+          const kws = Array.isArray(row.keywords) ? row.keywords.join(', ') : (row.keywords || '');
+          return '<div class="opt-card">' +
+            '<h3>Button ' + n + '</h3>' +
+            '<div class="qr-row">' +
+            '<div><label>Button label</label><input data-qr="label" data-n="' + n + '" value="' +
+            htmlEsc(row.label || '') + '" placeholder="e.g. Price &amp; Config" /></div>' +
+            '<div><label>Keywords (comma separated)</label><input data-qr="keywords" data-n="' + n +
+            '" value="' + htmlEsc(kws) + '" placeholder="price, cost, rates" /></div>' +
+            '</div>' +
+            '<label>Reply message</label><textarea data-qr="reply" data-n="' + n +
+            '" style="min-height:80px" placeholder="What WhatsApp should send when they tap ' + n +
+            ' or type a keyword">' + htmlEsc(row.reply || '') + '</textarea>' +
+            '<label>Optional link</label><input data-qr="link" data-n="' + n + '" value="' +
+            htmlEsc(row.link || '') + '" placeholder="https://…" />' +
+            '</div>';
+        }).join('');
+        document.getElementById('qrPresetHint').textContent =
+          'Category: ' + (category || 'general') +
+          '. “Use template” fills starter text you can edit. Empty reply = that number is skipped.';
+      }
+
+      function collectQuickReplies() {
+        const buttons = [1, 2, 3, 4].map((n) => {
+          const label = document.querySelector('[data-qr="label"][data-n="' + n + '"]')?.value || '';
+          const keywords = document.querySelector('[data-qr="keywords"][data-n="' + n + '"]')?.value || '';
+          const reply = document.querySelector('[data-qr="reply"][data-n="' + n + '"]')?.value || '';
+          const link = document.querySelector('[data-qr="link"][data-n="' + n + '"]')?.value || '';
+          return {
+            id: 'opt_' + n,
+            number: n,
+            label: label.trim(),
+            keywords: keywords.split(/[,|]/).map((k) => k.trim()).filter(Boolean),
+            reply: reply.trim(),
+            link: link.trim()
+          };
+        });
+        return {
+          enabled: document.getElementById('qrEnabled').checked,
+          welcome_extra: document.getElementById('qrWelcomeExtra').value.trim(),
+          buttons
+        };
+      }
+
+      document.getElementById('qrLoadPresetBtn').onclick = async () => {
+        const category = document.getElementById('businessCategory').value;
+        const res = await fetch('/api/tenant/quick-reply-presets?category=' + encodeURIComponent(category));
+        const data = await res.json();
+        if (!res.ok) {
+          document.getElementById('qrStatus').textContent = data.error || 'Could not load template';
+          return;
+        }
+        const preset = data.preset;
+        fillQuickReplies({
+          enabled: true,
+          preset: preset.id,
+          welcome_extra: preset.welcome_extra,
+          buttons: preset.buttons
+        }, category);
+        document.getElementById('qrStatus').textContent =
+          'Loaded “' + (preset.label || category) + '” template — edit the text, then Save.';
+        document.getElementById('qrStatus').className = 'meta ok';
+      };
+
+      document.getElementById('qrSaveBtn').onclick = async () => {
+        const status = document.getElementById('qrStatus');
+        status.textContent = 'Saving…';
+        const res = await fetch('/api/tenant/quick-replies', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ quick_replies: collectQuickReplies() })
+        });
+        const data = await res.json();
+        status.textContent = res.ok ? 'Quick buttons saved. Preview below will use them.' : (data.error || 'Save failed');
+        status.className = 'meta ' + (res.ok ? 'ok' : '');
+        if (res.ok) loadWelcomePreview();
+      };
 
       document.getElementById('customApiKey').addEventListener('input', (e) => {
         e.target.dataset.unchanged = '0';
@@ -395,22 +524,22 @@ export function tenantDashboardPage() {
           const data = await res.json();
           document.getElementById('previewPhoneName').textContent =
             (data.profileLabel || 'Your assistant') + ' · WhatsApp';
-          document.getElementById('previewHint').textContent = data.customKnowledge
-            ? 'Answers use your saved knowledge base — the same content WhatsApp will send.'
-            : 'No custom knowledge yet, so this preview uses the default industry template. Save a profile in step 2 to see your own replies.';
+          document.getElementById('previewHint').textContent = data.menuOptions && data.menuOptions.length
+            ? 'Welcome includes your numbered buttons. Tap a chip or type 1 / 2 / price to see that reply.'
+            : data.customKnowledge
+              ? 'Answers use your saved knowledge base — the same content WhatsApp will send.'
+              : 'No custom knowledge yet, so this preview uses the default industry template. Save a profile in step 2 to see your own replies.';
           log.innerHTML = '<div class="bubble ai">' + previewEsc(data.welcome || data.reply || '') + '</div>';
           const chips = document.getElementById('previewChips');
           const options = data.menuOptions && data.menuOptions.length
             ? data.menuOptions
-            : [
-                { id: 'tell me about your location', title: 'Location' },
-                { id: 'what do you offer?', title: 'Services' },
-                { id: 'what is the price?', title: 'Pricing' }
-              ];
-          chips.innerHTML = options.map((o) =>
-            '<button class="chip" type="button" data-q="' + previewEsc(o.id || o.title) + '">' +
-            previewEsc(o.title) + '</button>'
-          ).join('');
+            : [];
+          chips.innerHTML = options.length
+            ? options.map((o) =>
+                '<button class="chip" type="button" data-q="' + previewEsc(o.id || o.title) + '">' +
+                previewEsc(o.title) + '</button>'
+              ).join('')
+            : '<span class="meta">Save Quick Buttons (step 3) to show 1–4 chips here, or type a question below.</span>';
           chips.querySelectorAll('.chip').forEach((btn) => {
             btn.onclick = () => {
               document.getElementById('previewQuestion').value = btn.dataset.q;

@@ -5,6 +5,14 @@ import {
   getActiveDemoProfile,
 } from './demoProfiles.js';
 import { generateAiReply } from './aiRouter.js';
+import {
+  isQuickRepliesEnabled,
+  formatWelcomeWithQuickReplies,
+  formatQuickReplyMenu,
+  formatQuickReplyAnswer,
+  matchQuickReply,
+  quickReplyMenuOptions,
+} from './quickReplies.js';
 
 const DESC_LIMIT = 8000;
 const KNOWLEDGE_LIMIT = 24000;
@@ -82,9 +90,13 @@ export async function buildTenantSystemInstruction(tenant) {
 export async function previewTenantChat(tenant, question = '') {
   const profileId = tenantProfileId(tenant);
   const custom = hasTenantKnowledge(tenant);
+  const qrOn = isQuickRepliesEnabled(tenant);
   let welcome = tenantWelcomeMessage(tenant);
   let menuOptions = [];
-  if (!custom) {
+  if (qrOn) {
+    welcome = formatWelcomeWithQuickReplies(welcome, tenant);
+    menuOptions = quickReplyMenuOptions(tenant);
+  } else if (!custom) {
     const preview = await getDemoWelcomePreview(profileId);
     welcome = preview.welcomeText || welcome;
     menuOptions = preview.menuOptions || [];
@@ -112,6 +124,30 @@ export async function previewTenantChat(tenant, question = '') {
       menuOptions,
       profileLabel: tenant?.business_name || 'Your business',
     };
+  }
+
+  if (qrOn) {
+    const hit = matchQuickReply(q, tenant.quick_replies);
+    if (hit?.type === 'menu') {
+      return {
+        welcome,
+        reply: formatQuickReplyMenu(tenant),
+        mode: 'quick-menu',
+        customKnowledge: custom,
+        menuOptions,
+        profileLabel: tenant?.business_name || 'Your business',
+      };
+    }
+    if (hit?.type === 'button') {
+      return {
+        welcome,
+        reply: formatQuickReplyAnswer(hit.button),
+        mode: 'quick-reply',
+        customKnowledge: custom,
+        menuOptions,
+        profileLabel: tenant?.business_name || 'Your business',
+      };
+    }
   }
 
   if (!custom) {

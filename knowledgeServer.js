@@ -64,6 +64,11 @@ import {
   loadAiConfig,
 } from './aiConfigStore.js';
 import { peekActiveAi } from './aiRouter.js';
+import {
+  getQuickReplyPreset,
+  listQuickReplyPresetSummaries,
+  normalizeQuickReplies,
+} from './quickReplies.js';
 import { demoPageHtml } from './demoPage.js';
 import { scrapeWebsite } from './websiteScraper.js';
 import {
@@ -518,6 +523,32 @@ export function startKnowledgeServer(port = Number(process.env.PORT) || 3000) {
     try {
       const tenant = await updateTenantSettings(req.session.tenantId, req.body || {});
       res.json({ ok: true, tenant });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err.message || String(err) });
+    }
+  });
+
+  app.get('/api/tenant/quick-reply-presets', requireTenant, (req, res) => {
+    const category = String(req.query.category || '').trim();
+    const preset = getQuickReplyPreset(category);
+    res.json({
+      ok: true,
+      category: preset.id,
+      preset,
+      presets: listQuickReplyPresetSummaries(),
+    });
+  });
+
+  app.post('/api/tenant/quick-replies', requireTenant, async (req, res) => {
+    try {
+      const tenant = await getTenantById(req.session.tenantId);
+      if (!tenant) return res.status(404).json({ ok: false, error: 'Tenant not found' });
+      const quick_replies = normalizeQuickReplies(
+        req.body?.quick_replies || req.body,
+        tenant.business_category
+      );
+      const saved = await updateTenantSettings(req.session.tenantId, { quick_replies });
+      res.json({ ok: true, tenant: saved });
     } catch (err) {
       res.status(400).json({ ok: false, error: err.message || String(err) });
     }

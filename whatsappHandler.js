@@ -47,6 +47,13 @@ import {
   tenantWelcomeMessage,
 } from './tenantPrompt.js';
 import {
+  isQuickRepliesEnabled,
+  formatWelcomeWithQuickReplies,
+  formatQuickReplyMenu,
+  formatQuickReplyAnswer,
+  matchQuickReply,
+} from './quickReplies.js';
+import {
   sendWithTyping,
   allowInboundMessage,
   redactSecrets,
@@ -358,6 +365,7 @@ export async function handleMessagesUpsert(sock, { messages, type } = {}, { tena
         (!platformDemoId && liveTenant?.business_type === 'real_estate');
       const platformFilter = Boolean(liveTenant?.is_platform);
       const customKb = hasTenantKnowledge(liveTenant) && !platformDemoId;
+      const qrEnabled = isQuickRepliesEnabled(liveTenant);
 
       if (
         platformFilter &&
@@ -375,6 +383,15 @@ export async function handleMessagesUpsert(sock, { messages, type } = {}, { tena
       try {
         if (!isTracked) {
           markTracked(senderJid);
+          if (qrEnabled) {
+            await sendWithTyping(
+              sock,
+              senderJid,
+              formatWelcomeWithQuickReplies(tenantWelcomeMessage(liveTenant), liveTenant)
+            );
+            await recordHandledTurn(liveTenant, senderJid);
+            return;
+          }
           if (customKb) {
             await sendWithTyping(sock, senderJid, tenantWelcomeMessage(liveTenant));
             await recordHandledTurn(liveTenant, senderJid);
@@ -399,6 +416,20 @@ export async function handleMessagesUpsert(sock, { messages, type } = {}, { tena
           await startVilasaDemo(sock, senderJid, { sendWithTyping });
           await recordHandledTurn(liveTenant, senderJid);
           return;
+        }
+
+        if (qrEnabled) {
+          const hit = matchQuickReply(messageText, liveTenant.quick_replies, { selectedId });
+          if (hit?.type === 'menu') {
+            await sendWithTyping(sock, senderJid, formatQuickReplyMenu(liveTenant));
+            await recordHandledTurn(liveTenant, senderJid);
+            return;
+          }
+          if (hit?.type === 'button') {
+            await sendWithTyping(sock, senderJid, formatQuickReplyAnswer(hit.button));
+            await recordHandledTurn(liveTenant, senderJid);
+            return;
+          }
         }
 
         if (customKb) {
